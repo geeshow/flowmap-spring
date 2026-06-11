@@ -20,6 +20,66 @@ Spring **Kotlin/Java** 프로젝트를 정적 분석해서, 메서드 사이의 
 
 ---
 
+## 예시 다이어그램 (`.repo/sample-shop`)
+
+아래는 번들된 데모 프로젝트를 실제로 분석한 결과입니다(`analyze --project sample-shop`).
+색 = 레이어, **점선 = 비동기(async)** 호출, `external` 라벨 = 외부 API 호출.
+
+```mermaid
+flowchart LR
+  OCp["OrderController.placeOrder<br/>POST /orders"]:::ctrl
+  OCn["OrderController.notifyOrder<br/>POST /orders/{id}/notify"]:::ctrl
+  OSp["OrderService.placeOrder"]:::svc
+  OSa["OrderService.sendConfirmationAsync<br/>@Async"]:::svc
+  OSr["OrderService.reconcile<br/>suspend"]:::svc
+  NS["NotificationService.notify"]:::svc
+  ORs["OrderRepository.save"]:::repo
+  ORf["OrderRepository.findById"]:::repo
+  PAY["PaymentClient.charge<br/>POST https://pay.internal/charge"]:::ext
+  WC["WebClient.post"]:::ext
+
+  OCp -->|sync| OSp
+  OCn -. async .-> OSa
+  OSp -->|sync| ORs
+  OSp -->|sync · external| PAY
+  OSa -->|sync| ORf
+  OSa -->|sync| NS
+  OSr -->|sync| ORf
+  OSr -. async .-> NS
+  NS -->|sync · external| WC
+
+  classDef ctrl fill:#dbeafe,stroke:#1e40af,color:#1e3a8a;
+  classDef svc  fill:#dcfce7,stroke:#166534,color:#14532d;
+  classDef repo fill:#fef9c3,stroke:#854d0e,color:#713f12;
+  classDef ext  fill:#fee2e2,stroke:#991b1b,color:#7f1d1d;
+```
+
+읽는 포인트: `notifyOrder→sendConfirmationAsync`는 `@Async`라 **비동기(점선)**, `reconcile→notify`는
+`launch{}` 안이라 비동기이지만 같은 `notify`를 일반 호출하는 `sendConfirmationAsync→notify`는 동기.
+`PaymentClient`(`@FeignClient`)는 외부 URL까지 해석되고, `WebClient.post`는 런타임 URL이라 미해석.
+
+스프링 배치 와이어링(`@Configuration @EnableBatchProcessing`)도 별도 엣지로 표현됩니다:
+
+```mermaid
+flowchart LR
+  JOB["settlementJob<br/>(Job)"]:::batch
+  STEP["settlementStep<br/>(Step)"]:::batch
+  RDR["settlementReader<br/>(ItemReader)"]:::batch
+  PRC["settlementProcessor<br/>(ItemProcessor)"]:::batch
+  WRT["settlementWriter<br/>(ItemWriter)"]:::batch
+
+  JOB -->|batch:step| STEP
+  STEP -->|batch:reader| RDR
+  STEP -->|batch:processor| PRC
+  STEP -->|batch:writer| WRT
+
+  classDef batch fill:#ede9fe,stroke:#5b21b6,color:#4c1d95;
+```
+
+> 특정 API만 보고 싶으면 `search`로 해당 메서드의 BFS 서브그래프를 뽑아 같은 식으로 그릴 수 있습니다.
+
+---
+
 ## 두 가지 구현
 
 같은 node-link JSON 계약을 만족하는 두 구현이 있습니다. 목적에 따라 고르세요.
