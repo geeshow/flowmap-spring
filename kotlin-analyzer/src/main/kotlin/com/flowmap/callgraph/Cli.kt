@@ -15,6 +15,7 @@ fun main(args: Array<String>) {
     val opts = parseOpts(args.drop(1))
     when (cmd) {
         "analyze" -> cmdAnalyze(opts)
+        "combine" -> cmdCombine(opts)
         "search" -> cmdSearch(opts)
         "stats" -> cmdStats(opts)
         "-h", "--help", "help" -> usage()
@@ -87,6 +88,37 @@ private fun cmdAnalyze(opts: Opts) {
     dump(graph, opts["--out"], meta)
 }
 
+private fun cmdCombine(opts: Opts) {
+    val paths = collectGraphPaths(opts)
+    if (paths.isEmpty()) {
+        System.err.println("combine: provide --graphs a.json,b.json,... or --dir <dir of *.json>")
+        exitProcess(2)
+    }
+    val graphs = paths.map { JsonOutput.read(File(it).readText()) }
+    val result = CrossRun.combine(graphs)
+    val s2s = result.edges.count { it.kind == EdgeKind.S2S }
+    val meta = linkedMapOf<String, Any?>(
+        "command" to "combine",
+        "inputs" to paths.map { File(it).name },
+        "projects" to result.nodes.mapNotNull { it.project }.distinct().sorted(),
+        "nodes" to result.nodes.size, "edges" to result.edges.size, "s2sEdges" to s2s,
+    )
+    dump(result, opts["--out"], meta)
+    System.err.println("combined ${paths.size} graphs: ${result.nodes.size} nodes, ${result.edges.size} edges, $s2s s2s")
+}
+
+/** Graph inputs for `combine`: explicit `--graphs` CSV, and/or every `*.json` under `--dir`. */
+private fun collectGraphPaths(opts: Opts): List<String> {
+    val out = LinkedHashSet<String>()
+    opts["--graphs"]?.split(",")?.map { it.trim() }?.filter { it.isNotEmpty() }?.forEach { out.add(it) }
+    opts["--dir"]?.let { dir ->
+        // skip "_*.json" so a prior combine output (e.g. _combined.json) isn't re-ingested
+        File(dir).listFiles { f -> f.isFile && f.name.endsWith(".json") && !f.name.startsWith("_") }
+            ?.sortedBy { it.name }?.forEach { out.add(it.path) }
+    }
+    return out.toList()
+}
+
 private fun cmdSearch(opts: Opts) {
     val method = opts["--method"] ?: run { System.err.println("--method required"); exitProcess(2) }
     val (graph, _) = graphFromOpts(opts)
@@ -140,6 +172,7 @@ private fun usage() {
         """
         callgraph (Kotlin Analysis API)
           analyze --repo <dir> [--project P] [--out f.json] [--include-other] [--profile p] [--props kv.txt]
+          combine --graphs a.json,b.json,... | --dir <dir of *.json> [--out f.json]
           search  --method M [--graph g.json | --repo <dir>] [--direction both|callers|callees] [--depth N] [--out f]
           stats   [--graph g.json | --repo <dir>] [--project P] [--profile p]
         """.trimIndent()

@@ -46,6 +46,7 @@ object JsonOutput {
                 kind = when (e.str("kind")) {
                     "external" -> EdgeKind.EXTERNAL
                     "batch" -> EdgeKind.BATCH
+                    "s2s" -> EdgeKind.S2S
                     else -> EdgeKind.INTERNAL
                 },
                 relation = e.str("relation") ?: "call",

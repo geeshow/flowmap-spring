@@ -34,12 +34,19 @@ gradle wrapper --gradle-version 8.12      # 최초 1회 (래퍼 커밋)
 ./gradlew run --args="analyze --repo ../.repo --project sample-shop --out /tmp/shop.json"
 ./gradlew run --args="analyze --repo ../.repo --project <your-project> --profile local --out /tmp/out.json"
 
+# cross-run combine: 프로젝트별 그래프를 합쳐 서비스 간 호출(S2S) 연결
+#   한 서비스의 Feign/HttpExchange 외부 호출(verb+path)이 다른 서비스 컨트롤러
+#   엔드포인트와 매칭되면 external → s2s 엣지로 재연결, 미매칭(서드파티)은 external 유지.
+./gradlew run --args="combine --dir ./json --out ./json/_combined.json"
+./gradlew run --args="combine --graphs ./json/tera-cloud-user.json,./json/bank-broker.json --out /tmp/c.json"
+
 # 검색(BFS) / 통계
 ./gradlew run --args="search --method placeOrder --graph /tmp/shop.json --direction both --depth 3"
 ./gradlew run --args="stats --graph /tmp/shop.json"
 ```
 
 옵션: `analyze --repo --project --out --include-other --profile --props kv.txt`,
+`combine --graphs a.json,b.json,... | --dir <dir of *.json> --out`  (`--dir`는 `_*.json` 출력 제외),
 `search --method --graph|--repo --direction both|callers|callees --depth --out`,
 `stats --graph|--repo --project --profile`.
 `--props`는 `key=value` 한 줄씩 파일로 `${...}`를 오프라인 보강(예: configserver 값 대체).
