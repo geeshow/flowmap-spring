@@ -7,6 +7,7 @@ import org.jetbrains.kotlin.cli.jvm.compiler.EnvironmentConfigFiles
 import org.jetbrains.kotlin.cli.jvm.compiler.KotlinCoreEnvironment
 import org.jetbrains.kotlin.cli.jvm.compiler.NoScopeRecordCliBindingTrace
 import org.jetbrains.kotlin.cli.jvm.compiler.TopDownAnalyzerFacadeForJVM
+import org.jetbrains.kotlin.cli.jvm.config.addJvmClasspathRoots
 import org.jetbrains.kotlin.com.intellij.openapi.util.Disposer
 import org.jetbrains.kotlin.com.intellij.psi.PsiElement
 import org.jetbrains.kotlin.config.CommonConfigurationKeys
@@ -58,6 +59,17 @@ class AnalysisSession : Resolver {
                 put(CommonConfigurationKeys.MODULE_NAME, projectFilter ?: "repo")
                 put(CLIConfigurationKeys.MESSAGE_COLLECTOR_KEY, MessageCollector.NONE)
                 addKotlinSourceRoots(sourceRoots.map { it.absolutePath })
+                // Put the analyzer's own runtime classpath (which bundles the Spring
+                // annotation/base-type jars declared in build.gradle.kts) on the analysis
+                // classpath, so Spring stereotypes, @*Mapping args, @FeignClient, Spring Data
+                // base interfaces, and Batch types RESOLVE in the binding context.
+                addJvmClasspathRoots(
+                    (System.getProperty("java.class.path") ?: "")
+                        .split(File.pathSeparator)
+                        .filter { it.isNotBlank() }
+                        .map { File(it) }
+                        .filter { it.exists() }
+                )
                 // JDK_HOME lets KotlinCoreEnvironment configure the JDK itself; we avoid
                 // the version-unstable configureJdkClasspathRoots() extension. Library
                 // (Spring/JDK) symbols stay unresolved by design — short-name fallback covers them.

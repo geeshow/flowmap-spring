@@ -11,6 +11,8 @@ import org.jetbrains.kotlin.psi.KtNameReferenceExpression
 import org.jetbrains.kotlin.psi.KtProperty
 import org.jetbrains.kotlin.resolve.BindingContext
 import org.jetbrains.kotlin.resolve.DescriptorToSourceUtils
+import org.jetbrains.kotlin.resolve.constants.ArrayValue
+import org.jetbrains.kotlin.resolve.constants.ConstantValue
 import org.jetbrains.kotlin.resolve.constants.StringValue
 import org.jetbrains.kotlin.types.TypeUtils
 
@@ -117,10 +119,21 @@ class ConstantEvaluator(private val bc: BindingContext) {
         /** Read a string annotation argument by name (else the first/`value` argument). */
         fun firstStringArg(ann: AnnotationDescriptor, vararg names: String): String? {
             for (n in names) {
-                (ann.allValueArguments[Name.identifier(n)] as? StringValue)?.let { return it.value }
+                stringOf(ann.allValueArguments[Name.identifier(n)])?.let { return it }
             }
-            (ann.allValueArguments[Name.identifier("value")] as? StringValue)?.let { return it.value }
-            return (ann.allValueArguments.values.firstOrNull() as? StringValue)?.value
+            stringOf(ann.allValueArguments[Name.identifier("value")])?.let { return it }
+            return ann.allValueArguments.values.firstNotNullOfOrNull { stringOf(it) }
+        }
+
+        /**
+         * Unwrap a constant to its first string literal. Spring mapping annotations
+         * declare `String[] value()/path()`, so a resolved `@GetMapping("/x")` arrives
+         * as an [ArrayValue] of [StringValue]s, not a bare [StringValue].
+         */
+        private fun stringOf(v: ConstantValue<*>?): String? = when (v) {
+            is StringValue -> v.value
+            is ArrayValue -> v.value.firstNotNullOfOrNull { stringOf(it) }
+            else -> null
         }
     }
 }
