@@ -148,8 +148,16 @@ class GraphBuilder(
     private fun resolveCall(call: IrCall, fromId: String, f: IrFile) {
         when (val r = call.resolution) {
             is CallResolution.Internal -> {
+                // Constructor calls (`Foo(...)`) aren't graph nodes — match the Python tool, which
+                // never resolves a method named like a constructor. Drops the bulk of dangling edges.
+                if (r.calleeMethod == "<init>") return
                 val tid = nid(r.calleeFqcn, r.calleeMethod)
                 if (tid !in nodes) ensureProjectNode(r.calleeFqcn, r.calleeMethod)
+                // Method declared on a supertype/fragment (or synthetic, e.g. enum valueOf):
+                // attribute it to the receiver type so the edge stays navigable (as Python does
+                // by walking supertypes). Drops the edge only if the owner isn't a project type.
+                if (tid !in nodes) stubNode(r.calleeFqcn, r.calleeMethod)?.let { addNode(it) }
+                if (tid !in nodes) return
                 emit(fromId, tid, asyncMode(call.inAsyncCtx, r.calleeIsAsync),
                     EdgeKind.INTERNAL, "call", f, call.line)
             }
@@ -189,6 +197,22 @@ class GraphBuilder(
         val (t, f) = typeByFqcn[fqcn] ?: return
         val fn = t.functions.firstOrNull { it.name == method } ?: return
         addNode(makeNode(t, fn, f, layerOfType.getValue(fqcn)))
+    }
+
+    /**
+     * A node for a method the receiver type owns by inheritance (supertype/fragment) or
+     * synthesis (enum `valueOf`/`values`) — not declared on the type itself. Returns null
+     * when the owner isn't a project type (caller then drops the edge).
+     */
+    private fun stubNode(fqcn: String, method: String): MethodNode? {
+        val (_, f) = typeByFqcn[fqcn] ?: return null
+        return MethodNode(
+            id = nid(fqcn, method), fqcn = normalizeFqcn(fqcn), method = method,
+            layer = layerOfType.getValue(fqcn), visibility = "public", isAsync = false,
+            returnType = null, httpMethod = null, endpoint = null, externalService = null,
+            externalUrl = null, file = f.path, line = null, project = f.project, module = f.module,
+            urlPlaceholder = null, clientPackage = null,
+        )
     }
 
     private fun externalNode(
