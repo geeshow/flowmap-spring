@@ -38,8 +38,11 @@ class GraphBuilder(
                 val fromId = "${t.fqcn}#${fn.name}"
                 for (call in fn.calls) resolveCall(call, fromId, f)
                 if (isBatchBean(fn)) wireBatch(t, fn, f, fromId)
+                wireKafka(fn, f, fromId)
             }
         }
+        // 3) DB table resource edges (repository -> table)
+        wireDb()
         return CallGraph(nodes.values.toList(), edges.values.toList())
     }
 
@@ -143,6 +146,10 @@ class GraphBuilder(
                     url = r.url, placeholder = r.urlPlaceholder, clientPackage = r.clientPackage))
                 emit(fromId, tid, asyncMode(call.inAsyncCtx), EdgeKind.EXTERNAL, "call", f, call.line)
             }
+            is CallResolution.Resource -> {
+                addNode(resourceNode(r.nodeId, r.resourceType, r.label))
+                emit(fromId, r.nodeId, asyncMode(call.inAsyncCtx), EdgeKind.RESOURCE, r.relation, f, call.line)
+            }
             is CallResolution.RepositoryInherited -> {
                 if (layerOfType[r.receiverFqcn] != Layer.REPOSITORY) return
                 if (r.method !in Classify.REPOSITORY_INHERITED_METHODS) return
@@ -190,6 +197,49 @@ class GraphBuilder(
             if (tid !in nodes) addNode(makeNode(t, target, f, layerOfType.getValue(t.fqcn)))
             emit(fromId, tid, CallMode.ASYNC, EdgeKind.BATCH, relation, f, fn.line)
         }
+    }
+
+    // ---- infra resources (Kafka / Redis / DB) ----
+
+    private fun resourceNode(id: String, rtype: String, label: String): MethodNode = MethodNode(
+        id = id, fqcn = id, method = label, layer = Layer.RESOURCE, visibility = "public",
+        isAsync = false, returnType = null, httpMethod = null, endpoint = null,
+        externalService = null, externalUrl = null, file = null, line = null,
+        project = null, module = null, urlPlaceholder = null, clientPackage = null,
+        resourceType = rtype,
+    )
+
+    private fun wireKafka(fn: IrFunction, f: IrFile, fromId: String) {
+        for (topic in fn.kafkaProduced) {
+            val tid = "kafka:$topic"
+            addNode(resourceNode(tid, "kafka-topic", topic))
+            emit(fromId, tid, CallMode.ASYNC, EdgeKind.RESOURCE, "kafka:produce", f, fn.line)
+        }
+        for (topic in fn.kafkaConsumed) {
+            val tid = "kafka:$topic"
+            addNode(resourceNode(tid, "kafka-topic", topic))
+            emit(tid, fromId, CallMode.ASYNC, EdgeKind.RESOURCE, "kafka:consume", f, fn.line)
+        }
+    }
+
+    /** Each repository node gets an edge to its managed DB table resource node. */
+    private fun wireDb() {
+        for ((fqcn, pair) in typeByFqcn) {
+            if (layerOfType[fqcn] != Layer.REPOSITORY) continue
+            val (t, f) = pair
+            val entity = t.repoEntity ?: continue
+            val table = tableFor(entity)
+            val tid = "db:table:$table"
+            addNode(resourceNode(tid, "db-table", table))
+            for (n in nodes.values.filter { it.fqcn == fqcn }) {
+                emit(n.id, tid, CallMode.SYNC, EdgeKind.RESOURCE, "db:io", f, n.line)
+            }
+        }
+    }
+
+    private fun tableFor(entitySimple: String): String {
+        val entity = typeByFqcn.values.firstOrNull { it.first.simpleName == entitySimple && it.first.isEntity }
+        return entity?.first?.tableName ?: entitySimple.lowercase()
     }
 
     // ---- url helpers ----

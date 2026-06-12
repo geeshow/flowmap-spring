@@ -36,6 +36,9 @@ data class IrType(
     val functions: List<IrFunction>,
     val file: String?,
     val line: Int?,
+    val isEntity: Boolean = false,        // @Entity
+    val tableName: String? = null,        // @Table(name=...) or derived
+    val repoEntity: String? = null,       // entity simple name from Repository<Entity, Id>
 )
 
 data class IrFunction(
@@ -51,6 +54,10 @@ data class IrFunction(
     val calls: List<IrCall>,
     /** Spring Batch builder wiring found in the body: (relation, beanName argument). */
     val batchWiring: List<Pair<String, String>>,
+    /** Kafka topics this function sends to (KafkaTemplate.send("topic", ...)). */
+    val kafkaProduced: List<String> = emptyList(),
+    /** Kafka topics this function consumes (@KafkaListener(topics=[...])). */
+    val kafkaConsumed: List<String> = emptyList(),
 )
 
 /** A resolved call site. [resolution] carries everything GraphBuilder needs. */
@@ -99,6 +106,14 @@ sealed interface CallResolution {
     data class RepositoryInherited(
         val receiverFqcn: String,
         val method: String,
+    ) : CallResolution
+
+    /** Imperative infra resource usage (Redis / JdbcTemplate) -> shared RESOURCE node. */
+    data class Resource(
+        val nodeId: String,       // "redis" | "db:jdbc"
+        val resourceType: String, // "redis" | "db-table"
+        val label: String,        // node method/label, e.g. "Redis" | "JDBC"
+        val relation: String,     // "redis:io" | "db:io"
     ) : CallResolution
 
     /** Out of scope (library call we don't model). Dropped. */

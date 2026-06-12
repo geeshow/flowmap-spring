@@ -43,6 +43,32 @@ object Classify {
         "org.springframework.cloud.openfeign.",
     )
 
+    // ---- infra resources (Kafka / Redis / DB) ----
+
+    /** Kafka producer: a `send`/`sendDefault` call on one of these receiver types. */
+    val KAFKA_TEMPLATE_TYPES: Set<String> = setOf("KafkaTemplate", "ReplyingKafkaTemplate")
+    val KAFKA_SEND_METHODS: Set<String> = setOf("send", "sendDefault", "sendOffsetsToTransaction")
+
+    /** Kafka consumer: method annotated with one of these (topics taken from `@KafkaListener`). */
+    val KAFKA_LISTENER_ANNOTATIONS: Set<String> = setOf("KafkaListener", "KafkaHandler", "RetryableTopic")
+
+    /** Redis: a call on one of these receiver types -> shared `redis` resource node. */
+    val REDIS_TEMPLATE_TYPES: Set<String> = setOf(
+        "RedisTemplate", "StringRedisTemplate", "ReactiveRedisTemplate", "ReactiveStringRedisTemplate",
+    )
+
+    /** JdbcTemplate-family -> DB resource node (not a 3rd-party HTTP call). */
+    val JDBC_TEMPLATE_TYPES: Set<String> = setOf("JdbcTemplate", "NamedParameterJdbcTemplate")
+
+    /** JPA entity marker. */
+    val ENTITY_ANNOTATIONS: Set<String> = setOf("Entity")
+
+    /** Spring Data base interfaces whose first type argument is the managed entity. */
+    val REPOSITORY_GENERIC_BASES: Set<String> = setOf(
+        "JpaRepository", "CrudRepository", "PagingAndSortingRepository", "ListCrudRepository",
+        "ReactiveCrudRepository", "CoroutineCrudRepository", "Repository",
+    )
+
     val FEIGN_CLIENT_ANNOTATIONS: Set<String> = setOf("FeignClient")
 
     /** Spring 6 declarative HTTP interface marker (class- or method-level). */

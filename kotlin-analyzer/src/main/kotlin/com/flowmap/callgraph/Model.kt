@@ -9,11 +9,11 @@ package com.flowmap.callgraph
  */
 
 enum class Layer {
-    CONTROLLER, SERVICE, REPOSITORY, COMPONENT, CONFIG, BATCH, EXTERNAL, OTHER
+    CONTROLLER, SERVICE, REPOSITORY, COMPONENT, CONFIG, BATCH, EXTERNAL, RESOURCE, OTHER
 }
 
 enum class EdgeKind(val json: String) {
-    INTERNAL("internal"), EXTERNAL("external"), BATCH("batch"), S2S("s2s")
+    INTERNAL("internal"), EXTERNAL("external"), BATCH("batch"), S2S("s2s"), RESOURCE("resource")
 }
 
 enum class CallMode(val json: String) {
@@ -38,6 +38,7 @@ data class MethodNode(
     val module: String?,
     val urlPlaceholder: String?,     // ADDITIVE: raw "${...}" before yml resolution
     val clientPackage: String?,      // ADDITIVE: package of the external client class/interface
+    val resourceType: String? = null, // RESOURCE node kind: "kafka-topic" | "redis" | "db-table"
 ) {
     fun toJson(): LinkedHashMap<String, Any?> = linkedMapOf(
         "id" to id,
@@ -51,6 +52,7 @@ data class MethodNode(
         "endpoint" to endpoint,
         "externalService" to externalService,
         "externalUrl" to externalUrl,
+        "resourceType" to resourceType,
         "urlPlaceholder" to urlPlaceholder,
         "clientPackage" to clientPackage,
         "file" to file,

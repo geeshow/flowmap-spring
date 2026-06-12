@@ -21,7 +21,9 @@ node-link JSON.
 | 오버로드/확장함수/암시적 receiver 호출 | 부정확 | 심볼 해석으로 정확 |
 | 외부 노드에 패키지 | 없음 | `clientPackage` 추가 |
 
-추가 JSON 키(기존 계약에 **additive**): `urlPlaceholder`(원본 `${...}`), `clientPackage`.
+추가 JSON 키(기존 계약에 **additive**): `urlPlaceholder`(원본 `${...}`), `clientPackage`, `resourceType`(RESOURCE 노드 종류: `kafka-topic`|`redis`|`db-table`).
+
+**인프라 리소스 탐지**(Python 도구와 동등): `@Entity`/`@Table` + `JpaRepository<E,Id>` → `db:table:*` 노드, `KafkaTemplate.send("topic")`/`@KafkaListener` → `kafka:*` 토픽 노드(produce/consume 엣지), `RedisTemplate`/`JdbcTemplate` → `redis`/`db:jdbc` 노드. 토픽 노드 id가 서비스 간 공유되므로 `combine`에서 이벤트 흐름이 자동으로 이어진다.
 
 ## 빌드 & 실행
 
@@ -34,9 +36,12 @@ gradle wrapper --gradle-version 8.12      # 최초 1회 (래퍼 커밋)
 ./gradlew run --args="analyze --repo ../.repo --project sample-shop --out /tmp/shop.json"
 ./gradlew run --args="analyze --repo ../.repo --project <your-project> --profile local --out /tmp/out.json"
 
-# cross-run combine: 프로젝트별 그래프를 합쳐 서비스 간 호출(S2S) 연결
-#   한 서비스의 Feign/HttpExchange 외부 호출(verb+path)이 다른 서비스 컨트롤러
-#   엔드포인트와 매칭되면 external → s2s 엣지로 재연결, 미매칭(서드파티)은 external 유지.
+# cross-run combine: 프로젝트별 그래프를 합쳐 서비스 간 호출(S2S)/이벤트 연결
+#   - Feign/HttpExchange 외부 호출(verb+path)이 다른 서비스 컨트롤러 엔드포인트와
+#     매칭되면 external → s2s 엣지로 재연결 (미매칭 서드파티는 external 유지)
+#   - Kafka는 produce→topic→consume 가 공유 토픽 리소스 노드를 통해 자동 연결
+#     (한 서비스가 produce, 다른 서비스가 @KafkaListener consume)
+#   - Redis / DB 테이블도 공유 리소스 노드로 서비스 간 결합을 표현
 ./gradlew run --args="combine --dir ./json --out ./json/_combined.json"
 ./gradlew run --args="combine --graphs ./json/tera-cloud-user.json,./json/bank-broker.json --out /tmp/c.json"
 

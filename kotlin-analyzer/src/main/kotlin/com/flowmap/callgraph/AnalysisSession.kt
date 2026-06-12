@@ -16,8 +16,10 @@ import org.jetbrains.kotlin.config.JVMConfigurationKeys
 import org.jetbrains.kotlin.descriptors.ClassDescriptor
 import org.jetbrains.kotlin.descriptors.FunctionDescriptor
 import org.jetbrains.kotlin.lexer.KtTokens
+import org.jetbrains.kotlin.psi.KtAnnotationEntry
 import org.jetbrains.kotlin.psi.KtCallExpression
 import org.jetbrains.kotlin.psi.KtClassOrObject
+import org.jetbrains.kotlin.psi.KtCollectionLiteralExpression
 import org.jetbrains.kotlin.psi.KtDotQualifiedExpression
 import org.jetbrains.kotlin.psi.KtExpression
 import org.jetbrains.kotlin.psi.KtFile
@@ -42,6 +44,10 @@ import java.io.File
 class AnalysisSession : Resolver {
 
     private val skipDirs = setOf(".git", "build", "out", "target", "node_modules", ".gradle", ".idea")
+
+    /** `JpaRepository<Entity, Id>` -> entity type argument. Mirrors the Python `_REPO_GENERIC_RE`. */
+    private val REPO_GENERIC_RE =
+        Regex("\\b(${Classify.REPOSITORY_GENERIC_BASES.joinToString("|")})\\s*<\\s*([\\w.]+)")
 
     override fun analyze(
         repoRoot: String,
@@ -143,6 +149,7 @@ class AnalysisSession : Resolver {
             val superNames = desc?.typeConstructor?.supertypes
                 ?.mapNotNull { it.constructor.declarationDescriptor?.name?.asString() }?.toSet().orEmpty()
             val funcs = cls.declarations.filterIsInstance<KtNamedFunction>().map { buildFunction(it, yml) }
+            val (isEntity, tableName) = entityTableOf(cls)
             return IrType(
                 fqcn = cls.fqName?.asString() ?: (cls.name ?: "?"),
                 simpleName = cls.name ?: "?",
@@ -157,6 +164,9 @@ class AnalysisSession : Resolver {
                 functions = funcs,
                 file = relPath,
                 line = lineOf(cls),
+                isEntity = isEntity,
+                tableName = tableName,
+                repoEntity = repoEntityOf(cls),
             )
         }
 
@@ -180,6 +190,8 @@ class AnalysisSession : Resolver {
                 line = lineOf(fn),
                 calls = calls,
                 batchWiring = batch,
+                kafkaProduced = body?.let { kafkaProducedTopics(it) }.orEmpty(),
+                kafkaConsumed = kafkaConsumedTopics(fn),
             )
         }
 
@@ -211,6 +223,16 @@ class AnalysisSession : Resolver {
             val recvType = receiverDeclaredType(callExpr) ?: return CallResolution.Unresolved
             val method = (callExpr.calleeExpression as? KtNameReferenceExpression)?.getReferencedName()
                 ?: return CallResolution.Unresolved
+            // Infra resources take precedence over the generic external-client path.
+            if (recvType in Classify.KAFKA_TEMPLATE_TYPES) {
+                return CallResolution.Unresolved // wired separately from IrFunction.kafkaProduced
+            }
+            if (recvType in Classify.REDIS_TEMPLATE_TYPES) {
+                return CallResolution.Resource("redis", "redis", "Redis", "redis:io")
+            }
+            if (recvType in Classify.JDBC_TEMPLATE_TYPES) {
+                return CallResolution.Resource("db:jdbc", "db-table", "JDBC", "db:io")
+            }
             if (recvType in Classify.EXTERNAL_SIMPLE_TYPES) {
                 return ext.resolveImperative(callExpr, recvType, method, enclosingClassDesc(callExpr), yml)
             }
@@ -260,6 +282,58 @@ class AnalysisSession : Resolver {
             val rel = File(absPath).relativeToOrNull(root)?.path ?: return null to null
             val parts = rel.split(File.separator)
             return parts.getOrNull(0) to parts.getOrNull(1)
+        }
+
+        // ---- infra resource extraction (PSI; classpath-independent string args) ----
+
+        /** (isEntity, tableName). Default JPA table = entity simple name (lowercased later). */
+        private fun entityTableOf(cls: KtClassOrObject): Pair<Boolean, String?> {
+            val isEntity = cls.annotationEntries.any { it.shortName?.asString() in Classify.ENTITY_ANNOTATIONS }
+            if (!isEntity) return false to null
+            val table = cls.annotationEntries.firstOrNull { it.shortName?.asString() == "Table" }
+                ?.let { annNamedStringArg(it, "name") }
+            return true to (table ?: cls.name)
+        }
+
+        /** Entity simple name from `JpaRepository<Entity, Id>` (and friends), via supertype text. */
+        private fun repoEntityOf(cls: KtClassOrObject): String? {
+            for (st in cls.superTypeListEntries) {
+                val txt = st.typeReference?.text ?: continue
+                REPO_GENERIC_RE.find(txt)?.let { return it.groupValues[2].substringAfterLast('.') }
+            }
+            return null
+        }
+
+        /** Topics from `KafkaTemplate.send("topic", ...)` / `sendDefault("topic")` calls. */
+        private fun kafkaProducedTopics(body: KtExpression): List<String> {
+            val out = LinkedHashSet<String>()
+            body.collectDescendantsOfType<KtCallExpression>().forEach { call ->
+                val name = (call.calleeExpression as? KtNameReferenceExpression)?.getReferencedName()
+                if (name !in Classify.KAFKA_SEND_METHODS) return@forEach
+                val recv = receiverDeclaredType(call)
+                if (recv != null && recv !in Classify.KAFKA_TEMPLATE_TYPES) return@forEach
+                val first = call.valueArguments.firstOrNull()?.getArgumentExpression() ?: return@forEach
+                constEval.resolveStringExpr(first).literal?.let { out.add(it) }
+            }
+            return out.toList()
+        }
+
+        /** Topics from `@KafkaListener(topics = [...])` (else first positional arg). */
+        private fun kafkaConsumedTopics(fn: KtNamedFunction): List<String> {
+            val entry = fn.annotationEntries
+                .firstOrNull { it.shortName?.asString() in Classify.KAFKA_LISTENER_ANNOTATIONS } ?: return emptyList()
+            val arg = entry.valueArguments.firstOrNull { it.getArgumentName()?.asName?.asString() == "topics" }
+                ?: entry.valueArguments.firstOrNull()
+            val expr = arg?.getArgumentExpression() ?: return emptyList()
+            val exprs = (expr as? KtCollectionLiteralExpression)?.getInnerExpressions() ?: listOf(expr)
+            return exprs.mapNotNull { constEval.resolveStringExpr(it).literal }
+        }
+
+        private fun annNamedStringArg(entry: KtAnnotationEntry, argName: String): String? {
+            val arg = entry.valueArguments.firstOrNull { it.getArgumentName()?.asName?.asString() == argName }
+                ?: return null
+            val expr = arg.getArgumentExpression() ?: return null
+            return constEval.resolveStringExpr(expr).literal
         }
     }
 

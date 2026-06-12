@@ -29,6 +29,8 @@ dependencies {
     implementation("org.springframework.data:spring-data-jpa:3.2.10")
     implementation("org.springframework.cloud:spring-cloud-openfeign-core:4.1.3")
     implementation("org.springframework.batch:spring-batch-core:5.1.2")
+    implementation("org.springframework.kafka:spring-kafka:3.1.6")
+    implementation("org.springframework.data:spring-data-redis:3.2.10")
 
     testImplementation(kotlin("test"))
 }

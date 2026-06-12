@@ -36,6 +36,7 @@ object JsonOutput {
                 module = n.str("module"),
                 urlPlaceholder = n.str("urlPlaceholder"),
                 clientPackage = n.str("clientPackage"),
+                resourceType = n.str("resourceType"),
             )
         }
         val edges = root["edges"].map { e ->
@@ -47,6 +48,7 @@ object JsonOutput {
                     "external" -> EdgeKind.EXTERNAL
                     "batch" -> EdgeKind.BATCH
                     "s2s" -> EdgeKind.S2S
+                    "resource" -> EdgeKind.RESOURCE
                     else -> EdgeKind.INTERNAL
                 },
                 relation = e.str("relation") ?: "call",
