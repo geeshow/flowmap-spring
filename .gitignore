@@ -25,6 +25,10 @@ graph.json
 !/.repo/order-service/
 !/.repo/user-service/
 !/.repo/notification-service/
+!/.repo/admin-portal/
+!/.repo/twice-api/
+!/.repo/funding-service/
+!/.repo/bank-broker/
 
 # (gradle wrapper jar IS tracked — do not add a global *.jar ignore)
 
