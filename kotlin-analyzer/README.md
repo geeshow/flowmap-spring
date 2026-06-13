@@ -80,7 +80,9 @@ gradle wrapper --gradle-version 8.12      # 최초 1회 (래퍼 커밋)
 #   - git CLI로 기본 브랜치(main→master→develop 자동탐지) 커밋 목록 + 커밋별 -U0 헌크
 #   - 변경 .kt를 그 시점 blob 내용으로 PSI 재파싱해 (fqcn#method, 라인범위) 산출 → 헌크와 교집합
 #   - 변경 node id를 현재 분석 그래프에 조인, Bfs(CALLERS)로 영향받는 엔드포인트/서비스 전파
-#   - 산출: commits[](커밋별 변경노드+영향엔드포인트), subgraph(변경+호출자 서브그래프), endpointImpact[](엔드포인트→영향 커밋)
+#   - 삭제 엔드포인트: 부모 blob과 old−new 비교로 탐지, 경로가 현재도 제공되면 '이동'으로 다운그레이드,
+#     진짜 삭제인데 아직 호출하는 서비스가 있으면 breaking 경보(_combined.json 넘기면 교차서비스까지)
+#   - 산출: commits[], subgraph(변경+호출자), endpointImpact[](엔드포인트→커밋), deletedEndpoints[](+breaking)
 ./gradlew run --args="impact --git ../.repo/tera-cloud-user --graph ./json/tera-cloud-user.json --max 40 --depth 3 --out /tmp/impact.json"
 ./gradlew run --args="impact --git ../.repo/<proj> --repo ../.repo --project <proj> --range v1.2.0..HEAD --out /tmp/impact.json"
 

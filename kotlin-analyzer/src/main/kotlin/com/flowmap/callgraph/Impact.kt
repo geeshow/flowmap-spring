@@ -4,42 +4,71 @@ import java.io.File
 
 /**
  * Change-impact analysis: map each commit's changed lines to call-graph node ids and
- * propagate via reverse BFS (callers) to find affected endpoints/services.
+ * propagate via reverse BFS (callers) to find affected endpoints/services. Also detects
+ * DELETED endpoints (present in a commit's parent but not in the commit) and flags those
+ * still called by other services as breaking changes.
  *
- * Join model (the "recent range → current graph" mode): a method is "changed" in a
- * commit when that commit's changed line ranges fall inside the method's range *at that
- * revision* ([PsiSourceParser] on the blob content). The method's node id
- * (`<fqcn>#<method>`) is then joined to the CURRENT analyzed graph. Methods absent from
- * the current graph (renamed/removed/untracked layer) are reported with `inGraph:false`.
+ * Join model ("recent range → current graph"): a method is "changed" in a commit when
+ * the commit's changed line ranges fall inside the method's range *at that revision*
+ * ([PsiSourceParser] on the blob). Its node id (`<fqcn>#<method>`) is joined to the
+ * CURRENT analyzed graph; methods absent from it report `inGraph:false`.
  *
- * Outputs (all three requested):
- *  - `commits[]`     per-commit changed nodes + impacted endpoints/services
- *  - `subgraph`      node-link of all changed nodes + their caller chains (web hydrate)
- *  - `endpointImpact[]` aggregate: endpoint → which commits affect it (release notes)
+ * Deletion model: for each changed file, the parent blob is parsed too; methods present
+ * in the parent but gone in the commit are "deleted". A deleted method that was a
+ * controller endpoint (verb+path from PSI) is a deleted endpoint; if a current EXTERNAL
+ * caller node (best with `_combined.json`) still targets that (verb, normPath), it is a
+ * BREAKING change and the calling services are listed.
+ *
+ * Outputs: `commits[]` (changed + deleted per commit), `subgraph` (changed + callers),
+ * `endpointImpact[]` (endpoint → affecting commits), `deletedEndpoints[]` (+ breaking).
  */
 object Impact {
 
     fun analyze(repo: File, branch: String, commits: List<GitLog.Commit>, graph: CallGraph, depth: Int): Map<String, Any?> {
         val nodeById = graph.nodes.associateBy { it.id }
+        val breaking = BreakingIndex(graph)
         val parser = PsiSourceParser()
         val perCommit = ArrayList<Map<String, Any?>>()
         val allChangedInGraph = LinkedHashSet<String>()
         val endpointToCommits = LinkedHashMap<String, LinkedHashSet<String>>()
+        val deletedAgg = LinkedHashMap<String, DeletedEndpoint>()   // node id -> aggregate
 
         try {
             for (c in commits) {
+                val parent = c.parents.firstOrNull()
                 val changes = GitLog.changesIn(repo, c.sha)
                 val changedIds = LinkedHashSet<String>()
+                val deletedIds = LinkedHashSet<String>()
+                val deletedEps = ArrayList<Map<String, Any?>>()
+
                 for (ch in changes) {
-                    if (ch.changeType == "DELETE" || !ch.path.endsWith(".kt") || ch.newRanges.isEmpty()) continue
-                    val text = GitLog.fileAt(repo, c.sha, ch.path) ?: continue
-                    for (fn in parser.functions(ch.path, text)) {
-                        if (ch.newRanges.any { it.first <= fn.endLine && fn.startLine <= it.last }) changedIds.add(fn.nodeId)
+                    if (!ch.path.endsWith(".kt")) continue
+                    val newFns = if (ch.changeType == "DELETE") emptyList()
+                    else GitLog.fileAt(repo, c.sha, ch.path)?.let { parser.functions(ch.path, it) } ?: emptyList()
+
+                    // changed methods: hunks ∩ new-revision method ranges
+                    if (ch.changeType != "DELETE" && ch.newRanges.isNotEmpty()) {
+                        for (fn in newFns) if (ch.newRanges.any { it.first <= fn.endLine && fn.startLine <= it.last }) changedIds.add(fn.nodeId)
+                    }
+
+                    // deleted methods: present in parent, gone in this commit
+                    if (parent != null) {
+                        val oldPath = ch.oldPath ?: ch.path
+                        val oldFns = GitLog.fileAt(repo, parent, oldPath)?.let { parser.functions(oldPath, it) } ?: emptyList()
+                        val newIds = newFns.mapTo(HashSet()) { it.nodeId }
+                        for (fn in oldFns) if (fn.nodeId !in newIds) {
+                            deletedIds.add(fn.nodeId)
+                            if (fn.isEndpoint) {
+                                deletedEps.add(linkedMapOf("id" to fn.nodeId, "httpMethod" to fn.httpMethod, "endpoint" to fn.endpoint))
+                                deletedAgg.getOrPut(fn.nodeId) { DeletedEndpoint(fn.nodeId, fn.httpMethod, fn.endpoint) }
+                                    .commits.add(c.shortSha)
+                            }
+                        }
                     }
                 }
+
                 val inGraph = changedIds.filter { it in nodeById }
                 allChangedInGraph.addAll(inGraph)
-
                 val sub = Bfs.bfs(graph, inGraph, Bfs.Direction.CALLERS, depth)
                 val endpoints = sub.nodes.filter { it.endpoint != null || it.httpMethod != null }
                 val services = sub.nodes.mapNotNull { it.project ?: it.externalService }.distinct().sorted()
@@ -50,6 +79,8 @@ object Impact {
                     "date" to c.date, "subject" to c.subject,
                     "changedFiles" to changes.map { it.path },
                     "changedNodes" to changedIds.map { linkedMapOf("id" to it, "inGraph" to (it in nodeById)) },
+                    "deletedNodes" to deletedIds.toList(),
+                    "deletedEndpoints" to deletedEps,
                     "impactedEndpoints" to endpoints.map { endpointRef(it) },
                     "impactedServices" to services,
                 ))
@@ -68,15 +99,84 @@ object Impact {
             )
         }.sortedByDescending { (it["commits"] as List<*>).size }
 
+        val deletedEndpoints = deletedAgg.values.map { d ->
+            // path still served by another current controller? -> moved/renamed, not truly deleted
+            val served = breaking.servedNow(d.httpMethod, d.endpoint)
+            val callers = if (served) emptyList() else breaking.callersOf(d.httpMethod, d.endpoint)
+            linkedMapOf<String, Any?>(
+                "id" to d.id, "httpMethod" to d.httpMethod, "endpoint" to d.endpoint,
+                "removedInCommits" to d.commits.toList(),
+                "pathStillServed" to served,                 // true = endpoint moved to another controller
+                "breaking" to callers.isNotEmpty(),
+                "stillCalledBy" to callers,
+            )
+        }.sortedWith(compareByDescending<Map<String, Any?>> { it["breaking"] == true }
+            .thenBy { it["pathStillServed"] == true })
+
         return linkedMapOf(
-            "branch" to branch,
-            "commitCount" to commits.size,
-            "depth" to depth,
+            "branch" to branch, "commitCount" to commits.size, "depth" to depth,
             "changedNodeCount" to allChangedInGraph.size,
+            "deletedEndpointCount" to deletedEndpoints.size,
+            "trulyDeletedEndpointCount" to deletedEndpoints.count { it["pathStillServed"] == false },
+            "breakingDeletionCount" to deletedEndpoints.count { it["breaking"] == true },
             "commits" to perCommit,
             "subgraph" to subgraph.toNodeLink(linkedMapOf("kind" to "impact-subgraph")),
             "endpointImpact" to endpointImpact,
+            "deletedEndpoints" to deletedEndpoints,
         )
+    }
+
+    private class DeletedEndpoint(val id: String, val httpMethod: String?, val endpoint: String?) {
+        val commits = LinkedHashSet<String>()
+    }
+
+    /** Index of current EXTERNAL caller nodes by (verb, normPath) to flag breaking deletions. */
+    private class BreakingIndex(graph: CallGraph) {
+        private val nodeById = graph.nodes.associateBy { it.id }
+        // external target id -> caller nodes (sources of edges into it)
+        private val callersByExt = HashMap<String, MutableList<MethodNode>>()
+        private val externals: List<MethodNode>
+        private val controllers: List<Pair<String?, String>>   // (verb, normPath) of current endpoints
+
+        init {
+            for (e in graph.edges) {
+                val tgt = nodeById[e.target]
+                if (tgt?.layer == Layer.EXTERNAL) nodeById[e.source]?.let { callersByExt.getOrPut(e.target) { mutableListOf() }.add(it) }
+            }
+            externals = graph.nodes.filter { it.layer == Layer.EXTERNAL && !it.endpoint.isNullOrEmpty() }
+            controllers = graph.nodes.filter { it.layer == Layer.CONTROLLER && !it.endpoint.isNullOrEmpty() }
+                .map { it.httpMethod to normPath(it.endpoint) }
+        }
+
+        /** Is (verb, path) still served by some current controller? (deleted node but path moved) */
+        fun servedNow(verb: String?, path: String?): Boolean {
+            val np = normPath(path)
+            return np.isNotEmpty() && controllers.any { it.second == np && verbOk(it.first, verb) }
+        }
+
+        /** Services/nodes whose outbound call still targets (verb, path) of a now-deleted endpoint. */
+        fun callersOf(verb: String?, path: String?): List<Map<String, Any?>> {
+            val np = normPath(path)
+            if (np.isEmpty()) return emptyList()
+            val out = LinkedHashMap<String, Map<String, Any?>>()
+            for (ext in externals) {
+                if (normPath(ext.endpoint) != np || !verbOk(ext.httpMethod, verb)) continue
+                for (caller in callersByExt[ext.id].orEmpty()) {
+                    out.putIfAbsent(caller.id, linkedMapOf("caller" to caller.id, "service" to (caller.project ?: caller.externalService)))
+                }
+            }
+            return out.values.toList()
+        }
+
+        private fun normPath(p: String?): String {
+            if (p.isNullOrEmpty()) return ""
+            var s = p.substringBefore("?").replace(Regex("\\{[^}]*}"), "{}")
+            if (s.length > 1) s = s.trimEnd('/')
+            return s
+        }
+
+        private fun verbOk(a: String?, b: String?): Boolean =
+            a == null || b == null || a == "ANY" || b == "ANY" || a == b
     }
 
     private fun endpointRef(n: MethodNode): Map<String, Any?> = linkedMapOf(
