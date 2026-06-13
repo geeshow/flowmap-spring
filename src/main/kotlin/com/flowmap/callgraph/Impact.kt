@@ -19,24 +19,38 @@ import java.io.File
  * caller node (best with `_combined.json`) still targets that (verb, normPath), it is a
  * BREAKING change and the calling services are listed.
  *
- * Outputs: `commits[]` (changed + deleted per commit), `subgraph` (changed + callers),
- * `endpointImpact[]` (endpoint → affecting commits), `deletedEndpoints[]` (+ breaking).
+ * Analysis unit is the merged PULL REQUEST (via [GitHub]), not the raw commit: each
+ * PR is reduced to its merge commit, whose first-parent diff is the PR's net change
+ * set, fed into the line→node join above.
+ *
+ * Outputs: `pulls[]` (changed + deleted per PR), `subgraph` (changed + callers),
+ * `endpointImpact[]` (endpoint → affecting PR numbers), `deletedEndpoints[]` (+ breaking).
  */
 object Impact {
 
-    fun analyze(repo: File, branch: String, commits: List<GitLog.Commit>, graph: CallGraph, depth: Int): Map<String, Any?> {
+    /**
+     * Analyze impact per merged pull request: each PR is reduced to its merge
+     * commit, whose first-parent diff is the PR's net change set. The deep-link is
+     * `${repoUrl}/pull/${number}`, built by the consumer from `repoUrl` + the PR
+     * number on each entry. PRs without a merge commit available locally are skipped.
+     */
+    fun analyze(repo: File, base: String, pulls: List<GitHub.Pr>, graph: CallGraph, depth: Int): Map<String, Any?> {
+        // Repo web base (e.g. https://github.com/owner/repo) — deep-link each PR as
+        // `${repoUrl}/pull/${number}` from the number already on each entry.
+        val webBase = GitLog.webBaseUrl(repo)
         val nodeById = graph.nodes.associateBy { it.id }
         val breaking = BreakingIndex(graph)
         val parser = PsiSourceParser()
-        val perCommit = ArrayList<Map<String, Any?>>()
+        val perPull = ArrayList<Map<String, Any?>>()
         val allChangedInGraph = LinkedHashSet<String>()
-        val endpointToCommits = LinkedHashMap<String, LinkedHashSet<String>>()
+        val endpointToPulls = LinkedHashMap<String, LinkedHashSet<Int>>()
         val deletedAgg = LinkedHashMap<String, DeletedEndpoint>()   // node id -> aggregate
 
         try {
-            for (c in commits) {
-                val parent = c.parents.firstOrNull()
-                val changes = GitLog.changesIn(repo, c.sha)
+            for (pr in pulls) {
+                val sha = pr.mergeCommit ?: continue
+                val parent = GitLog.firstParent(repo, sha)
+                val changes = GitLog.changesIn(repo, sha)
                 val changedIds = LinkedHashSet<String>()
                 val deletedIds = LinkedHashSet<String>()
                 val deletedEps = ArrayList<Map<String, Any?>>()
@@ -44,14 +58,14 @@ object Impact {
                 for (ch in changes) {
                     if (!ch.path.endsWith(".kt")) continue
                     val newFns = if (ch.changeType == "DELETE") emptyList()
-                    else GitLog.fileAt(repo, c.sha, ch.path)?.let { parser.functions(ch.path, it) } ?: emptyList()
+                    else GitLog.fileAt(repo, sha, ch.path)?.let { parser.functions(ch.path, it) } ?: emptyList()
 
                     // changed methods: hunks ∩ new-revision method ranges
                     if (ch.changeType != "DELETE" && ch.newRanges.isNotEmpty()) {
                         for (fn in newFns) if (ch.newRanges.any { it.first <= fn.endLine && fn.startLine <= it.last }) changedIds.add(fn.nodeId)
                     }
 
-                    // deleted methods: present in parent, gone in this commit
+                    // deleted methods: present in the PR's base, gone after the merge
                     if (parent != null) {
                         val oldPath = ch.oldPath ?: ch.path
                         val oldFns = GitLog.fileAt(repo, parent, oldPath)?.let { parser.functions(oldPath, it) } ?: emptyList()
@@ -61,7 +75,7 @@ object Impact {
                             if (fn.isEndpoint) {
                                 deletedEps.add(linkedMapOf("id" to fn.nodeId, "httpMethod" to fn.httpMethod, "endpoint" to fn.endpoint))
                                 deletedAgg.getOrPut(fn.nodeId) { DeletedEndpoint(fn.nodeId, fn.httpMethod, fn.endpoint) }
-                                    .commits.add(c.shortSha)
+                                    .pulls.add(pr.number)
                             }
                         }
                     }
@@ -72,11 +86,11 @@ object Impact {
                 val sub = Bfs.bfs(graph, inGraph, Bfs.Direction.CALLERS, depth)
                 val endpoints = sub.nodes.filter { it.endpoint != null || it.httpMethod != null }
                 val services = sub.nodes.mapNotNull { it.project ?: it.externalService }.distinct().sorted()
-                for (ep in endpoints) endpointToCommits.getOrPut(ep.id) { LinkedHashSet() }.add(c.shortSha)
+                for (ep in endpoints) endpointToPulls.getOrPut(ep.id) { LinkedHashSet() }.add(pr.number)
 
-                perCommit.add(linkedMapOf(
-                    "sha" to c.sha, "shortSha" to c.shortSha, "author" to c.author,
-                    "date" to c.date, "subject" to c.subject,
+                perPull.add(linkedMapOf(
+                    "number" to pr.number, "title" to pr.title, "author" to pr.author,
+                    "mergedAt" to pr.mergedAt, "mergeCommit" to sha,
                     "changedFiles" to changes.map { it.path },
                     "changedNodes" to changedIds.map { linkedMapOf("id" to it, "inGraph" to (it in nodeById)) },
                     "deletedNodes" to deletedIds.toList(),
@@ -90,14 +104,14 @@ object Impact {
         }
 
         val subgraph = Bfs.bfs(graph, allChangedInGraph.toList(), Bfs.Direction.CALLERS, depth)
-        val endpointImpact = endpointToCommits.entries.map { (id, shas) ->
+        val endpointImpact = endpointToPulls.entries.map { (id, nums) ->
             val n = nodeById[id]
             linkedMapOf<String, Any?>(
                 "id" to id, "httpMethod" to n?.httpMethod, "endpoint" to n?.endpoint,
                 "service" to (n?.project ?: n?.externalService), "description" to n?.description,
-                "commits" to shas.toList(),
+                "pulls" to nums.toList(),
             )
-        }.sortedByDescending { (it["commits"] as List<*>).size }
+        }.sortedByDescending { (it["pulls"] as List<*>).size }
 
         val deletedEndpoints = deletedAgg.values.map { d ->
             // path still served by another current controller? -> moved/renamed, not truly deleted
@@ -105,7 +119,7 @@ object Impact {
             val callers = if (served) emptyList() else breaking.callersOf(d.httpMethod, d.endpoint)
             linkedMapOf<String, Any?>(
                 "id" to d.id, "httpMethod" to d.httpMethod, "endpoint" to d.endpoint,
-                "removedInCommits" to d.commits.toList(),
+                "removedInPulls" to d.pulls.toList(),
                 "pathStillServed" to served,                 // true = endpoint moved to another controller
                 "breaking" to callers.isNotEmpty(),
                 "stillCalledBy" to callers,
@@ -114,12 +128,12 @@ object Impact {
             .thenBy { it["pathStillServed"] == true })
 
         return linkedMapOf(
-            "branch" to branch, "commitCount" to commits.size, "depth" to depth,
+            "base" to base, "repoUrl" to webBase, "pullCount" to pulls.size, "depth" to depth,
             "changedNodeCount" to allChangedInGraph.size,
             "deletedEndpointCount" to deletedEndpoints.size,
             "trulyDeletedEndpointCount" to deletedEndpoints.count { it["pathStillServed"] == false },
             "breakingDeletionCount" to deletedEndpoints.count { it["breaking"] == true },
-            "commits" to perCommit,
+            "pulls" to perPull,
             "subgraph" to subgraph.toNodeLink(linkedMapOf("kind" to "impact-subgraph")),
             "endpointImpact" to endpointImpact,
             "deletedEndpoints" to deletedEndpoints,
@@ -127,7 +141,7 @@ object Impact {
     }
 
     private class DeletedEndpoint(val id: String, val httpMethod: String?, val endpoint: String?) {
-        val commits = LinkedHashSet<String>()
+        val pulls = LinkedHashSet<Int>()
     }
 
     /** Index of current EXTERNAL caller nodes by (verb, normPath) to flag breaking deletions. */

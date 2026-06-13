@@ -283,12 +283,13 @@ private fun cmdRefresh(opts: Opts) {
             if (!GitLog.isRepoRoot(p)) { System.err.println("  - ${p.name}: (not a standalone git repo, skip impact)"); continue }
             val branch = GitLog.resolveBranch(p, opts["--branch"])
             if (branch == null) { System.err.println("  - ${p.name}: (no default branch, skip impact)"); continue }
-            val commits = GitLog.commits(p, branch, impactMax, null)
-            val result = Impact.analyze(p, branch, commits, combined, impactDepth)
+            val pulls = GitHub.mergedPulls(p, branch, impactMax)
+            if (pulls.isEmpty()) { System.err.println("  - ${p.name}: (no merged PRs via gh for base $branch, skip impact)"); continue }
+            val result = Impact.analyze(p, branch, pulls, combined, impactDepth)
             File(outDir, "${p.name}.impact.json").writeText(JsonOutput.writeValue(result))
             impactCount++
             val breaking = result["breakingDeletionCount"]
-            System.err.println("  + ${p.name}.impact.json (@$branch: ${commits.size} commits, ${result["changedNodeCount"]} changed nodes, $breaking breaking deletions)")
+            System.err.println("  + ${p.name}.impact.json (base $branch: ${pulls.size} PRs, ${result["changedNodeCount"]} changed nodes, $breaking breaking deletions)")
         }
     }
 
@@ -355,19 +356,21 @@ private fun cmdImpact(opts: Opts) {
     }
     // current graph: load --graph, else analyze --repo/--project
     val graph = opts["--graph"]?.let { JsonOutput.read(File(it).readText()) } ?: graphFromOpts(opts).first
-    val range = opts["--range"]
     val max = opts["--max"]?.toIntOrNull() ?: 50
     val depth = opts["--depth"]?.toIntOrNull() ?: 3
-    val commits = GitLog.commits(git, branch, if (range == null) max else null, range)
-    System.err.println("impact: ${git.name}@$branch, ${commits.size} commits, depth $depth")
-    val result = Impact.analyze(git, branch, commits, graph, depth)
+    val pulls = GitHub.mergedPulls(git, branch, max)
+    if (pulls.isEmpty()) {
+        System.err.println("impact: no merged PRs via gh for base $branch (gh authed? on GitHub?)"); exitProcess(1)
+    }
+    System.err.println("impact: ${git.name} base $branch, ${pulls.size} PRs, depth $depth")
+    val result = Impact.analyze(git, branch, pulls, graph, depth)
     val text = JsonOutput.writeValue(result)
     val out = opts["--out"]
     if (out != null) {
         File(out).writeText(text)
         @Suppress("UNCHECKED_CAST")
         val eps = (result["endpointImpact"] as? List<*>)?.size ?: 0
-        System.err.println("wrote $out: ${commits.size} commits, ${result["changedNodeCount"]} changed nodes, $eps impacted endpoints")
+        System.err.println("wrote $out: ${pulls.size} PRs, ${result["changedNodeCount"]} changed nodes, $eps impacted endpoints")
     } else {
         println(text)
     }
@@ -504,7 +507,8 @@ private fun usage() {
           --- single-analysis tools (debugging / ad-hoc) ---
           analyze --repo <dir> [--project P] [--out f.json] [--include-other] [--public-only] [--profile p] [--props kv.txt] [--restdocs dir]
           openapi --repo <dir> [--project P] [--out f.json] [--restdocs dir] [--title T] [--api-version V] [--profile p] [--props kv.txt]
-          impact  --git <repo> (--graph g.json | --repo <dir> --project P) [--branch b] [--max N | --range A..B] [--depth N] [--out f.json]
+          impact  --git <repo> (--graph g.json | --repo <dir> --project P) [--branch b] [--max N] [--depth N] [--out f.json]
+                  # change-impact per merged PR (via `gh`, base = --branch or current); needs gh auth + a GitHub remote
           combine --graphs a.json,b.json,... | --dir <dir of *.json> [--gateway-routes routes.yml] [--gateway-name N] [--out f.json]
           search  --method M [--graph g.json | --repo <dir>] [--direction both|callers|callees] [--depth N] [--out f]
           stats   [--graph g.json | --repo <dir>] [--project P] [--profile p]
