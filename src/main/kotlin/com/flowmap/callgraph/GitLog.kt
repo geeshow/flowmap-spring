@@ -62,14 +62,23 @@ object GitLog {
         return (code == 0) to out.trim()
     }
 
-    /** Pick the default branch: explicit override → origin/HEAD → main/master/develop → current HEAD. */
+    /**
+     * Pick the branch to mine: explicit override → the currently checked-out
+     * branch → (only if HEAD is detached) origin/HEAD → main/master/develop.
+     *
+     * The checked-out branch wins so commit-log/impact analysis mines the branch
+     * the user actually selected (the same one `refresh` pulls) — not a default
+     * like `develop` that merely happens to exist.
+     */
     fun resolveBranch(repo: File, override: String?): String? {
         if (override != null) return if (verifyRef(repo, override)) override else null
+        currentBranch(repo).takeIf { it.isNotEmpty() && it != "HEAD" }?.let { return it }
+        // Detached HEAD: fall back to the repo's default branch.
         run(repo, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD")
             .trim().removePrefix("origin/").takeIf { it.isNotEmpty() }
             ?.let { if (verifyRef(repo, it)) return it }
         for (c in listOf("main", "master", "develop")) if (verifyRef(repo, c)) return c
-        return run(repo, "rev-parse", "--abbrev-ref", "HEAD").trim().takeIf { it.isNotEmpty() && it != "HEAD" }
+        return null
     }
 
     private fun verifyRef(repo: File, ref: String): Boolean =

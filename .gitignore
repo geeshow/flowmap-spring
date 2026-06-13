@@ -37,3 +37,6 @@ graph.json
 !/.repo/bank-broker/
 
 # (gradle wrapper jar IS tracked — do not add a global *.jar ignore)
+
+# IDE/compiled class output
+/bin/
