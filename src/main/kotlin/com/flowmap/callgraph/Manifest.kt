@@ -43,6 +43,7 @@ object Manifest {
     private fun projectGraphFiles(dir: File): List<File> =
         dir.listFiles { f ->
             f.isFile && f.name.endsWith(".json") && !f.name.startsWith("_") &&
+                f.name != "manifest.json" &&  // app-facing manifest, not a project graph
                 !f.name.endsWith(".openapi.json") && !f.name.endsWith(".impact.json") &&
                 !f.name.endsWith(".join.json") && !f.name.endsWith(".screens.json")
         }?.sortedBy { it.name } ?: emptyList()
@@ -92,17 +93,18 @@ object Manifest {
     }
 
     /**
-     * Build the manifest entries + serialized JSON for [dir], then write
-     * `_manifest.json` into it. Returns the number of project entries written.
+     * Build the manifest entries + serialized JSON for [dir], then write it into
+     * [dir] as [fileName] (default `_manifest.json`; the sync step writes the
+     * app-facing `manifest.json`). Returns the number of project entries written.
      */
-    fun write(dir: File): Int {
+    fun write(dir: File, fileName: String = "_manifest.json"): Int {
         val projects = projectGraphFiles(dir).map { entryFor(dir, it) }
         val manifest = linkedMapOf<String, Any?>(
             "version" to 1,
             "generated" to iso(Instant.now()),
             "projects" to projects,
         )
-        File(dir, "_manifest.json").writeText(mapper.writeValueAsString(manifest))
+        File(dir, fileName).writeText(mapper.writeValueAsString(manifest))
         return projects.size
     }
 }

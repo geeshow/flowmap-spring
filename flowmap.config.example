@@ -3,9 +3,17 @@
 # Format: shell-style KEY=VALUE, `#` comments, ${VAR}/$VAR expansion.
 #
 # --- backend analyzer (./gradlew run) -----------------------------------------
-COMMAND=refresh                 # subcommand to run (default: refresh)
-REPO=.repo                      # analysis repo root        -> --repo
-OUT_DIR=../flowmap5/docs/web/data   # output directory      -> --out-dir
+COMMAND=refresh
+# subcommand to run (default: refresh)
+REPO=.repo
+# analysis repo root        -> --repo
+OUT_DIR=../docs/web/data
+# analyzer output dir       -> --out-dir
+# SYNC_DIR=../docs/web/data
+# web app data dir to assemble: copies per-project artifacts (+ FRONTEND_DIR's)
+# here and writes the app-facing manifest.json. Replaces scripts/sync-data.sh.
+# FRONTEND_DIR=../../flowmap-react/json
+# ts-analyzer output dir(s), comma-separated -> --frontend-dir (pulled into SYNC_DIR)
 # EXTRA_ARGS=--no-pull --no-impact  # any extra flags, appended verbatim
 
 # --- frontend ts-analyzer (used by its own runner, ignored by the backend) ----

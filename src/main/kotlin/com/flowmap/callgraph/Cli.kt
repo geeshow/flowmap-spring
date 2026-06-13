@@ -18,6 +18,8 @@ const val DEFAULT_REPO = ".repo"
  *   COMMAND   the subcommand to run         (default: refresh)
  *   REPO      analysis repo root            -> --repo
  *   OUT_DIR   output directory              -> --out-dir
+ *   SYNC_DIR  web app data dir to assemble  -> --sync-dir   (optional)
+ *   FRONTEND_DIR  ts-analyzer output dir(s) -> --frontend-dir (optional, CSV)
  *   EXTRA_ARGS  extra CLI flags, space-separated, appended verbatim
  * Keys used only by the frontend ts-analyzer (NAME, BACKEND, …) are ignored here.
  */
@@ -104,6 +106,8 @@ private fun argsFromConfig(): Array<String> {
     out.add(cfg["COMMAND"]?.takeIf { it.isNotBlank() } ?: "refresh")
     cfg["REPO"]?.takeIf { it.isNotBlank() }?.let { out.add("--repo"); out.add(it) }
     cfg["OUT_DIR"]?.takeIf { it.isNotBlank() }?.let { out.add("--out-dir"); out.add(it) }
+    cfg["SYNC_DIR"]?.takeIf { it.isNotBlank() }?.let { out.add("--sync-dir"); out.add(it) }
+    cfg["FRONTEND_DIR"]?.takeIf { it.isNotBlank() }?.let { out.add("--frontend-dir"); out.add(it) }
     cfg["EXTRA_ARGS"]?.takeIf { it.isNotBlank() }?.let { extra ->
         out.addAll(extra.split(Regex("\\s+")).filter { it.isNotEmpty() })
     }
@@ -210,14 +214,17 @@ private fun cmdRefresh(opts: Opts) {
             "command" to "analyze", "project" to p.name, "nodes" to graph.nodes.size, "edges" to graph.edges.size)))
         val oapi = OpenApi.build(files, title = p.name, enrich = RestDocs.loadApi(snippets))
         File(outDir, "${p.name}.openapi.json").writeText(JsonOutput.writeValue(oapi))
-        System.err.println("  + ${p.name}: ${graph.nodes.size} nodes, ${graph.edges.size} edges")
+        @Suppress("UNCHECKED_CAST")
+        val pPaths = (oapi["paths"] as? Map<String, *>)?.size ?: 0
+        System.err.println("  + ${p.name}.json (${graph.nodes.size} nodes, ${graph.edges.size} edges)")
+        System.err.println("  + ${p.name}.openapi.json ($pPaths paths)")
     }
 
     // 3) prune ghost BACKEND outputs for projects no longer present/sourced.
     //    Leave frontend artifacts (ts-analyzer *.join.json/*.screens.json and
     //    frontend graphs) untouched so a SHARED output dir is safe to refresh.
     outDir.listFiles { f ->
-        f.isFile && f.name.endsWith(".json") && !f.name.startsWith("_") &&
+        f.isFile && f.name.endsWith(".json") && !f.name.startsWith("_") && f.name != "manifest.json" &&
             !f.name.endsWith(".join.json") && !f.name.endsWith(".screens.json")
     }?.forEach { f ->
         val isBackendSibling = f.name.endsWith(".openapi.json") || f.name.endsWith(".impact.json")
@@ -252,8 +259,12 @@ private fun cmdRefresh(opts: Opts) {
     File(outDir, "_combined.json").writeText(JsonOutput.write(combined, linkedMapOf(
         "command" to "refresh/combine", "projects" to liveBases.toList(),
         "nodes" to combined.nodes.size, "edges" to combined.edges.size, "s2sEdges" to s2s, "gatewayEdges" to gw)))
+    System.err.println("  + _combined.json (${combined.nodes.size} nodes, ${combined.edges.size} edges, $s2s s2s, $gw gateway)")
     val allOapi = OpenApi.build(allFiles, title = opts["--title"] ?: "flowmap-all")
     File(outDir, "_openapi.json").writeText(JsonOutput.writeValue(allOapi))
+    @Suppress("UNCHECKED_CAST")
+    val paths = (allOapi["paths"] as? Map<String, *>)?.size ?: 0
+    System.err.println("  + _openapi.json ($paths paths)")
 
     // 5) per-project commit/impact — mine each project's git history against the
     // COMBINED graph (so cross-service breaking-change detection sees external
@@ -272,15 +283,28 @@ private fun cmdRefresh(opts: Opts) {
             File(outDir, "${p.name}.impact.json").writeText(JsonOutput.writeValue(result))
             impactCount++
             val breaking = result["breakingDeletionCount"]
-            System.err.println("  ! ${p.name}@$branch: ${commits.size} commits, ${result["changedNodeCount"]} changed nodes, $breaking breaking deletions")
+            System.err.println("  + ${p.name}.impact.json (@$branch: ${commits.size} commits, ${result["changedNodeCount"]} changed nodes, $breaking breaking deletions)")
         }
     }
 
     // 6) lightweight manifest (additive — leaves _combined.json and friends intact)
     val manifestCount = Manifest.write(outDir)
+    System.err.println("  + _manifest.json ($manifestCount projects)")
 
-    @Suppress("UNCHECKED_CAST")
-    val paths = (allOapi["paths"] as? Map<String, *>)?.size ?: 0
+    // 7) optional sync: assemble the web app's data dir (ports scripts/sync-data.sh).
+    //    Copies per-project artifacts from OUT_DIR + any --frontend-dir into
+    //    --sync-dir, writes the app-facing manifest.json there, drops legacy files.
+    opts["--sync-dir"]?.takeIf { it.isNotBlank() }?.let { syncPath ->
+        val dest = File(syncPath)
+        val sources = ArrayList<File>().apply {
+            add(outDir)
+            opts["--frontend-dir"]?.split(",")?.map { it.trim() }?.filter { it.isNotEmpty() }
+                ?.forEach { add(File(it)) }
+        }
+        val r = Sync.run(sources, dest)
+        System.err.println("  sync: ${r.copied} files copied, manifest.json with ${r.projects} projects -> ${dest.path}")
+    }
+
     System.err.println("refresh done: ${liveBases.size} projects, combined ${combined.nodes.size} nodes / $s2s s2s, openapi $paths paths, impact $impactCount, manifest $manifestCount projects -> ${outDir.path}")
 }
 
@@ -398,7 +422,7 @@ private fun collectGraphPaths(opts: Opts): List<String> {
         // (*.openapi.json, *.impact.json). A defensive non-graph check in cmdCombine
         // also drops anything that slips through.
         File(dir).listFiles { f ->
-            f.isFile && f.name.endsWith(".json") && !f.name.startsWith("_") &&
+            f.isFile && f.name.endsWith(".json") && !f.name.startsWith("_") && f.name != "manifest.json" &&
                 !f.name.endsWith(".openapi.json") && !f.name.endsWith(".impact.json")
         }?.sortedBy { it.name }?.forEach { out.add(it.path) }
     }
@@ -464,10 +488,12 @@ private fun usage() {
 
           refresh — ONE-SHOT: pull every project + run ALL analyses (graph + openapi + restdocs + impact)
                     + combine (auto-discovers gateways from spring.cloud.gateway.routes) + manifest
+                    + optional sync (assemble the web app's data dir; ports sync-data.sh)
             refresh [--repo <dir>] [--out-dir ./json] [--no-pull] [--no-impact]
                     [--impact-max N] [--impact-depth N] [--branch b]
                     [--include-other] [--profile p] [--props kv.txt] [--title T]
                     [--gateway-routes routes.yml] [--gateway-name N]   # explicit gateway (else auto-discovered)
+                    [--sync-dir <web data dir>] [--frontend-dir d1,d2] # copy per-project artifacts + manifest.json there
 
           --- single-analysis tools (debugging / ad-hoc) ---
           analyze --repo <dir> [--project P] [--out f.json] [--include-other] [--profile p] [--props kv.txt] [--restdocs dir]
