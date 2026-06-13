@@ -18,6 +18,8 @@ const val DEFAULT_REPO = ".repo"
  *   COMMAND   the subcommand to run         (default: refresh)
  *   REPO      analysis repo root            -> --repo
  *   OUT_DIR   output directory              -> --out-dir
+ *   SYNC_DIR  web app data dir to assemble  -> --sync-dir   (optional)
+ *   FRONTEND_DIR  ts-analyzer output dir(s) -> --frontend-dir (optional, CSV)
  *   EXTRA_ARGS  extra CLI flags, space-separated, appended verbatim
  * Keys used only by the frontend ts-analyzer (NAME, BACKEND, …) are ignored here.
  */
@@ -104,6 +106,8 @@ private fun argsFromConfig(): Array<String> {
     out.add(cfg["COMMAND"]?.takeIf { it.isNotBlank() } ?: "refresh")
     cfg["REPO"]?.takeIf { it.isNotBlank() }?.let { out.add("--repo"); out.add(it) }
     cfg["OUT_DIR"]?.takeIf { it.isNotBlank() }?.let { out.add("--out-dir"); out.add(it) }
+    cfg["SYNC_DIR"]?.takeIf { it.isNotBlank() }?.let { out.add("--sync-dir"); out.add(it) }
+    cfg["FRONTEND_DIR"]?.takeIf { it.isNotBlank() }?.let { out.add("--frontend-dir"); out.add(it) }
     cfg["EXTRA_ARGS"]?.takeIf { it.isNotBlank() }?.let { extra ->
         out.addAll(extra.split(Regex("\\s+")).filter { it.isNotEmpty() })
     }
@@ -217,7 +221,7 @@ private fun cmdRefresh(opts: Opts) {
     //    Leave frontend artifacts (ts-analyzer *.join.json/*.screens.json and
     //    frontend graphs) untouched so a SHARED output dir is safe to refresh.
     outDir.listFiles { f ->
-        f.isFile && f.name.endsWith(".json") && !f.name.startsWith("_") &&
+        f.isFile && f.name.endsWith(".json") && !f.name.startsWith("_") && f.name != "manifest.json" &&
             !f.name.endsWith(".join.json") && !f.name.endsWith(".screens.json")
     }?.forEach { f ->
         val isBackendSibling = f.name.endsWith(".openapi.json") || f.name.endsWith(".impact.json")
@@ -278,6 +282,20 @@ private fun cmdRefresh(opts: Opts) {
 
     // 6) lightweight manifest (additive — leaves _combined.json and friends intact)
     val manifestCount = Manifest.write(outDir)
+
+    // 7) optional sync: assemble the web app's data dir (ports scripts/sync-data.sh).
+    //    Copies per-project artifacts from OUT_DIR + any --frontend-dir into
+    //    --sync-dir, writes the app-facing manifest.json there, drops legacy files.
+    opts["--sync-dir"]?.takeIf { it.isNotBlank() }?.let { syncPath ->
+        val dest = File(syncPath)
+        val sources = ArrayList<File>().apply {
+            add(outDir)
+            opts["--frontend-dir"]?.split(",")?.map { it.trim() }?.filter { it.isNotEmpty() }
+                ?.forEach { add(File(it)) }
+        }
+        val r = Sync.run(sources, dest)
+        System.err.println("  sync: ${r.copied} files copied, manifest.json with ${r.projects} projects -> ${dest.path}")
+    }
 
     @Suppress("UNCHECKED_CAST")
     val paths = (allOapi["paths"] as? Map<String, *>)?.size ?: 0
@@ -398,7 +416,7 @@ private fun collectGraphPaths(opts: Opts): List<String> {
         // (*.openapi.json, *.impact.json). A defensive non-graph check in cmdCombine
         // also drops anything that slips through.
         File(dir).listFiles { f ->
-            f.isFile && f.name.endsWith(".json") && !f.name.startsWith("_") &&
+            f.isFile && f.name.endsWith(".json") && !f.name.startsWith("_") && f.name != "manifest.json" &&
                 !f.name.endsWith(".openapi.json") && !f.name.endsWith(".impact.json")
         }?.sortedBy { it.name }?.forEach { out.add(it.path) }
     }
@@ -464,10 +482,12 @@ private fun usage() {
 
           refresh — ONE-SHOT: pull every project + run ALL analyses (graph + openapi + restdocs + impact)
                     + combine (auto-discovers gateways from spring.cloud.gateway.routes) + manifest
+                    + optional sync (assemble the web app's data dir; ports sync-data.sh)
             refresh [--repo <dir>] [--out-dir ./json] [--no-pull] [--no-impact]
                     [--impact-max N] [--impact-depth N] [--branch b]
                     [--include-other] [--profile p] [--props kv.txt] [--title T]
                     [--gateway-routes routes.yml] [--gateway-name N]   # explicit gateway (else auto-discovered)
+                    [--sync-dir <web data dir>] [--frontend-dir d1,d2] # copy per-project artifacts + manifest.json there
 
           --- single-analysis tools (debugging / ad-hoc) ---
           analyze --repo <dir> [--project P] [--out f.json] [--include-other] [--profile p] [--props kv.txt] [--restdocs dir]
