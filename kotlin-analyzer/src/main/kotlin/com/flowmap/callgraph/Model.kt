@@ -9,11 +9,11 @@ package com.flowmap.callgraph
  */
 
 enum class Layer {
-    CONTROLLER, SERVICE, REPOSITORY, COMPONENT, CONFIG, BATCH, EXTERNAL, RESOURCE, OTHER
+    CONTROLLER, SERVICE, REPOSITORY, COMPONENT, CONFIG, BATCH, EXTERNAL, RESOURCE, GATEWAY, OTHER
 }
 
 enum class EdgeKind(val json: String) {
-    INTERNAL("internal"), EXTERNAL("external"), BATCH("batch"), S2S("s2s"), RESOURCE("resource")
+    INTERNAL("internal"), EXTERNAL("external"), BATCH("batch"), S2S("s2s"), RESOURCE("resource"), GATEWAY("gateway")
 }
 
 enum class CallMode(val json: String) {

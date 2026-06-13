@@ -18,7 +18,7 @@ package com.flowmap.callgraph
  */
 object CrossRun {
 
-    fun combine(graphs: List<CallGraph>): CallGraph {
+    fun combine(graphs: List<CallGraph>, gatewayRoutes: List<Gateway.Route> = emptyList(), gatewayName: String = "gateway"): CallGraph {
         // 1) union nodes (first-seen wins) and edges (dedup by key)
         val nodes = LinkedHashMap<String, MethodNode>()
         for (g in graphs) for (n in g.nodes) nodes.putIfAbsent(n.id, n)
@@ -41,11 +41,59 @@ object CrossRun {
             newEdges.putIfAbsent(ne.key(), ne)
         }
 
-        // 4) drop external stubs that no surviving edge references anymore
+        // 4) gateway pass: a GATEWAY node per route + `gateway` edges to the routed
+        //    backend service's endpoints (frontend prefix vs server path made visible).
+        wireGateways(gatewayRoutes, gatewayName, providers, nodes, newEdges)
+
+        // 5) drop external stubs that no surviving edge references anymore
         val referenced = HashSet<String>()
         for (e in newEdges.values) { referenced.add(e.source); referenced.add(e.target) }
         val finalNodes = nodes.values.filter { it.layer != Layer.EXTERNAL || it.id in referenced }
         return CallGraph(finalNodes, newEdges.values.toList())
+    }
+
+    // ---- gateway routing ----
+
+    private fun wireGateways(
+        routes: List<Gateway.Route>, gatewayName: String, providers: List<MethodNode>,
+        nodes: LinkedHashMap<String, MethodNode>, edges: LinkedHashMap<List<Any?>, CallEdge>,
+    ) {
+        if (routes.isEmpty()) return
+        val byProject = providers.groupBy { it.project }
+        for (route in routes) {
+            val gwId = "gateway:$gatewayName#${route.routeId}"
+            nodes.putIfAbsent(gwId, gatewayNode(gwId, gatewayName, route))
+            val svc = matchService(route.targetService, byProject.keys) ?: continue
+            val bp = route.backendPrefix
+            for (ep in byProject[svc].orEmpty()) {
+                if (bp.isNotEmpty() && !normPath(ep.endpoint).startsWith(bp)) continue
+                if (route.methods.isNotEmpty() && ep.httpMethod != null &&
+                    ep.httpMethod != "ANY" && ep.httpMethod !in route.methods) continue
+                val e = CallEdge(gwId, ep.id, CallMode.SYNC, EdgeKind.GATEWAY, "gateway:route", null, null)
+                edges.putIfAbsent(e.key(), e)
+            }
+        }
+    }
+
+    private fun gatewayNode(id: String, gatewayName: String, route: Gateway.Route): MethodNode = MethodNode(
+        id = id, fqcn = gatewayName, method = route.routeId, layer = Layer.GATEWAY, visibility = "public",
+        isAsync = false, returnType = null,
+        httpMethod = route.methods.singleOrNull(), endpoint = route.publicPrefix,
+        externalService = route.targetService, externalUrl = route.uri,
+        file = null, line = null, project = gatewayName, module = null,
+        urlPlaceholder = null, clientPackage = null,
+        description = route.filters.ifEmpty { null },
+    )
+
+    /** Match a route's lb:// service to an analyzed project name (normalized). */
+    private fun matchService(target: String?, projects: Set<String?>): String? {
+        if (target == null) return null
+        val t = target.lowercase().filter(Char::isLetterOrDigit)
+        projects.filterNotNull().firstOrNull { it == target }?.let { return it }
+        return projects.filterNotNull().firstOrNull {
+            val p = it.lowercase().filter(Char::isLetterOrDigit)
+            p == t || p.contains(t) || t.contains(p)
+        }
     }
 
     // ---- endpoint matching (verb + normalized path, project hint as tie-breaker) ----

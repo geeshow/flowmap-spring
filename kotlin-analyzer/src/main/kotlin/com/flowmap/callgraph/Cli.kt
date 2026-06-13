@@ -144,11 +144,15 @@ private fun cmdRefresh(opts: Opts) {
     }
 
     // 4) combine (in-memory) + repo-wide OpenAPI
-    val combined = CrossRun.combine(builtGraphs)
+    val gwName = opts["--gateway-name"] ?: opts["--gateway-routes"]?.let { File(it).nameWithoutExtension } ?: "gateway"
+    val routes = Gateway.load(opts["--gateway-routes"], gwName)
+    if (routes.isNotEmpty()) System.err.println("  gateway: ${routes.size} routes from ${opts["--gateway-routes"]}")
+    val combined = CrossRun.combine(builtGraphs, routes, gwName)
     val s2s = combined.edges.count { it.kind == EdgeKind.S2S }
+    val gw = combined.edges.count { it.kind == EdgeKind.GATEWAY }
     File(outDir, "_combined.json").writeText(JsonOutput.write(combined, linkedMapOf(
         "command" to "refresh/combine", "projects" to liveBases.toList(),
-        "nodes" to combined.nodes.size, "edges" to combined.edges.size, "s2sEdges" to s2s)))
+        "nodes" to combined.nodes.size, "edges" to combined.edges.size, "s2sEdges" to s2s, "gatewayEdges" to gw)))
     val allOapi = OpenApi.build(allFiles, title = opts["--title"] ?: "flowmap-all")
     File(outDir, "_openapi.json").writeText(JsonOutput.writeValue(allOapi))
 
@@ -229,16 +233,20 @@ private fun cmdCombine(opts: Opts) {
         }
     }
     val graphs = usable.map { JsonOutput.read(File(it).readText()) }
-    val result = CrossRun.combine(graphs)
+    val gwName = opts["--gateway-name"] ?: opts["--gateway-routes"]?.let { File(it).nameWithoutExtension } ?: "gateway"
+    val routes = Gateway.load(opts["--gateway-routes"], gwName)
+    if (opts["--gateway-routes"] != null) System.err.println("gateway: loaded ${routes.size} routes from ${opts["--gateway-routes"]}")
+    val result = CrossRun.combine(graphs, routes, gwName)
     val s2s = result.edges.count { it.kind == EdgeKind.S2S }
+    val gw = result.edges.count { it.kind == EdgeKind.GATEWAY }
     val meta = linkedMapOf<String, Any?>(
         "command" to "combine",
         "inputs" to usable.map { File(it).name },
         "projects" to result.nodes.mapNotNull { it.project }.distinct().sorted(),
-        "nodes" to result.nodes.size, "edges" to result.edges.size, "s2sEdges" to s2s,
+        "nodes" to result.nodes.size, "edges" to result.edges.size, "s2sEdges" to s2s, "gatewayEdges" to gw,
     )
     dump(result, opts["--out"], meta)
-    System.err.println("combined ${usable.size} graphs: ${result.nodes.size} nodes, ${result.edges.size} edges, $s2s s2s")
+    System.err.println("combined ${usable.size} graphs: ${result.nodes.size} nodes, ${result.edges.size} edges, $s2s s2s, $gw gateway")
 }
 
 /** Graph inputs for `combine`: explicit `--graphs` CSV, and/or every `*.json` under `--dir`. */
@@ -314,7 +322,7 @@ private fun usage() {
           refresh --repo <dir> [--out-dir ./json] [--no-pull] [--include-other] [--profile p] [--props kv.txt] [--title T]
           openapi --repo <dir> [--project P] [--out f.json] [--restdocs dir] [--title T] [--api-version V] [--profile p] [--props kv.txt]
           impact  --git <repo> (--graph g.json | --repo <dir> --project P) [--branch b] [--max N | --range A..B] [--depth N] [--out f.json]
-          combine --graphs a.json,b.json,... | --dir <dir of *.json> [--out f.json]
+          combine --graphs a.json,b.json,... | --dir <dir of *.json> [--gateway-routes routes.yml] [--gateway-name N] [--out f.json]
           search  --method M [--graph g.json | --repo <dir>] [--direction both|callers|callees] [--depth N] [--out f]
           stats   [--graph g.json | --repo <dir>] [--project P] [--profile p]
         """.trimIndent()

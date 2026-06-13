@@ -61,6 +61,7 @@ object JsonOutput {
                     "batch" -> EdgeKind.BATCH
                     "s2s" -> EdgeKind.S2S
                     "resource" -> EdgeKind.RESOURCE
+                    "gateway" -> EdgeKind.GATEWAY
                     else -> EdgeKind.INTERNAL
                 },
                 relation = e.str("relation") ?: "call",

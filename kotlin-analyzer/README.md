@@ -95,6 +95,12 @@ gradle wrapper --gradle-version 8.12      # 최초 1회 (래퍼 커밋)
 ./gradlew run --args="combine --dir ./json --out ./json/_combined.json"
 ./gradlew run --args="combine --graphs ./json/tera-cloud-user.json,./json/bank-broker.json --out /tmp/c.json"
 
+# gateway flow: Spring Cloud Gateway 라우트 yml을 주면 게이트웨이를 별도 노드로 분리하고
+#   프론트-facing 경로 → [gateway 노드] → 백엔드 서버 엔드포인트를 gateway 엣지로 연결.
+#   라우트가 외부 Config Server로 외부화된 경우, resolved 라우트 yml을 --gateway-routes로 공급.
+#   filters(StripPrefix/PrefixPath/RewritePath)로 백엔드 경로를 계산해 (verb,path)로 매칭.
+./gradlew run --args="combine --dir ./json --gateway-routes /path/gateway-routes.yml --gateway-name tera-cloud-gateway --out ./json/_combined.json"
+
 # 검색(BFS) / 통계
 ./gradlew run --args="search --method placeOrder --graph /tmp/shop.json --direction both --depth 3"
 ./gradlew run --args="stats --graph /tmp/shop.json"
@@ -104,7 +110,7 @@ gradle wrapper --gradle-version 8.12      # 최초 1회 (래퍼 커밋)
 `refresh --repo --out-dir <json dir> --no-pull --include-other --profile --props --title`  (전 프로젝트 pull+재분석+combine+openapi 일괄 갱신),
 `openapi --repo --project --out --restdocs <snippets-dir> --title --api-version --profile --props`  (OpenAPI 3.1 JSON 출력; `--project` 생략 시 repo 전체를 서비스 tag로 묶은 단일 문서),
 `impact --git <repo> (--graph g.json | --repo --project) --branch --max N | --range A..B --depth --out`  (커밋 변경 → 메서드 → 영향도; 기본 브랜치 자동탐지),
-`combine --graphs a.json,b.json,... | --dir <dir of *.json> --out`  (`--dir`는 `_*.json` 출력 제외),
+`combine --graphs a.json,b.json,... | --dir <dir of *.json> [--gateway-routes routes.yml] [--gateway-name N] --out`  (`--dir`는 `_*.json`/`*.openapi.json` 제외; gateway 라우트 주면 GATEWAY 노드+`gateway` 엣지 추가),
 `search --method --graph|--repo --direction both|callers|callees --depth --out`,
 `stats --graph|--repo --project --profile`.
 `--props`는 `key=value` 한 줄씩 파일로 `${...}`를 오프라인 보강(예: configserver 값 대체).
@@ -119,6 +125,7 @@ gradle wrapper --gradle-version 8.12      # 최초 1회 (래퍼 커밋)
   GraphBuilder.kt IR → CallGraph(엣지/배치/엔드포인트)
   OpenApi.kt      IR → OpenAPI 3.1(엔드포인트→paths, DTO→schemas)
   Bfs.kt          callers/callees BFS
+  Gateway.kt      Spring Cloud Gateway 라우트 yml 파서(게이트웨이 flow)
   GitLog.kt       git CLI: 커밋/diff 헌크/blob (영향도)
   PsiSourceParser.kt  파일 텍스트 → (fqcn#method, 라인범위) [PSI, 해석 불필요]
   Impact.kt       변경라인→메서드→그래프 역방향 BFS 영향도

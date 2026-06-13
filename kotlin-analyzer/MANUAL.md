@@ -33,6 +33,7 @@ BindingContext)** 로 정적 분석해서 ① 콜그래프, ② 서비스 간(S2
 ```
 <fqcn>#<method>           예) com.acme.order.OrderService#placeOrder
 ext:<service>#<method>    외부(Feign/RestTemplate/WebClient) 호출 노드
+gateway:<name>#<routeId>  게이트웨이 라우트 노드(layer GATEWAY)
 kafka:<topic> / redis / db:table:<t> / db:jdbc   인프라 리소스 노드
 ```
 
@@ -155,6 +156,39 @@ Spring Data 상속 메서드(save/findById…).
 ```bash
 ./gradlew run --args="combine --dir ./json --out ./json/_combined.json"
 ```
+
+### 3.2.1 게이트웨이 flow (`combine --gateway-routes`)
+
+Spring Cloud Gateway 라우트 테이블을 주면, **게이트웨이를 별도 노드(layer `GATEWAY`)로 분리**하고
+프론트-facing 경로 → 게이트웨이 → 백엔드 서버 엔드포인트를 `gateway` 엣지로 잇는다. 게이트웨이가
+경로를 재작성(StripPrefix/PrefixPath/RewritePath)하므로 **공개 경로와 서버 경로가 다른 점**을 표현한다.
+
+| 옵션 | 설명 |
+|---|---|
+| `--gateway-routes <file>` | 라우트 yml. 라우트가 Config Server로 외부화됐으면 resolved yml을 공급 |
+| `--gateway-name <N>` | 게이트웨이 노드 식별자(기본: 파일명) |
+
+라우트 yml 위치: `spring.cloud.gateway.routes` / 최상위 `routes:` / 문서 루트가 리스트. 각 라우트에서
+`id`, `uri`(`lb://<service>`→타깃 서비스), `predicates`의 `Path`(+선택 `Method`), `filters`
+(`StripPrefix=N`, `PrefixPath=/x`, `RewritePath=from,to`)를 읽는다.
+
+매칭: 필터로 **백엔드 경로 prefix**를 계산 → 타깃 서비스의 컨트롤러 엔드포인트 중 그 prefix로 시작하는
+것에 `gateway` 엣지 연결(verb는 combine과 동일하게 ANY 허용). 노드 필드: `endpoint`=공개 prefix,
+`externalService`=타깃 서비스, `externalUrl`=`lb://...`, `description`=필터 요약.
+
+```bash
+./gradlew run --args="combine --dir ./json \
+  --gateway-routes /path/gateway-routes.yml --gateway-name tera-cloud-gateway --out ./json/_combined.json"
+```
+
+예 (검증됨): `RewritePath=/api/fund/(?<seg>.*), /internal/investment/${'$'}{seg}` 라우트 →
+`프론트 GET /api/fund/current-summary` 가 `서버 GET /internal/investment/current-summary`
+(`InvestmentController#currentValidSummary`)로 연결된다. 공개 경로 = `publicPrefix` + (서버 경로에서
+`backendPrefix` 제거분).
+
+> 한계: 프론트(JS/TS) 소스는 이 도구가 분석하지 않으므로 **프론트→게이트웨이 엣지는 자동 생성되지
+> 않는다**. 게이트웨이 라우트 노드를 "공개 진입점"으로 본다. 게이트웨이가 직접 서빙하는 컨트롤러
+> (예: `ImageController`)는 그 repo를 `analyze`하면 일반 CONTROLLER 노드로 잡힌다.
 
 ### 3.3 `openapi` — OpenAPI 3.1 생성
 
@@ -279,7 +313,7 @@ node-link 형식. 키 순서·null 포함은 Python 도구 계약과 일치.
   "edges": [{
     "source": "...#a", "target": "...#b",
     "mode": "sync",                                  // "sync"|"async"
-    "kind": "internal",                              // internal|external|s2s|batch|resource
+    "kind": "internal",                              // internal|external|s2s|gateway|batch|resource
     "relation": "call",                              // call|batch:step|kafka:produce|db:io|...
     "callSiteFile": "...", "callSiteLine": 12
   }]
