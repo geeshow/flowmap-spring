@@ -74,6 +74,8 @@ data class IrFunction(
     val returnTypeSimple: String?,
     val httpMethod: String?,          // method-level @*Mapping / @*Exchange verb
     val path: String?,                // method-level path
+    /** Swagger/OpenAPI endpoint description from @Operation/@ApiOperation; null if absent. */
+    val apiDescription: String? = null,
     val isBean: Boolean,
     /** Fully resolved return type (for response schema); null when unresolvable. */
     val returnTypeRef: IrTypeRef? = null,

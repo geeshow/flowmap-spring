@@ -32,6 +32,11 @@ dependencies {
     implementation("org.springframework.kafka:spring-kafka:3.1.6")
     implementation("org.springframework.data:spring-data-redis:3.2.10")
 
+    // Swagger / OpenAPI annotations, so the K1 front-end can RESOLVE the values of
+    // @Operation(summary|description) (springdoc / OAS v3). Lets a Swagger-documented
+    // project produce the same endpoint descriptions as Spring REST Docs.
+    implementation("io.swagger.core.v3:swagger-annotations:2.2.22")
+
     testImplementation(kotlin("test"))
 }
 

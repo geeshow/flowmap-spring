@@ -240,6 +240,7 @@ class AnalysisSession : Resolver {
                 returnTypeSimple = ret,
                 httpMethod = verb,
                 path = path,
+                apiDescription = desc?.let { ext.apiDescriptionOf(it) },
                 isBean = "Bean" in annNames,
                 returnTypeRef = retRef,
                 parameters = params,

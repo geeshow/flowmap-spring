@@ -109,7 +109,8 @@ object OpenApi {
             op["operationId"] = opId
             op["tags"] = listOf(tag)
             val doc = enrich[verb to RestDocs.normalize(path)] ?: enrich["ANY" to RestDocs.normalize(path)]
-            doc?.description?.let { op["summary"] = it }
+            // REST Docs description wins; else the Swagger @Operation description.
+            (doc?.description ?: fn.apiDescription)?.let { op["summary"] = it }
 
             val params = ArrayList<Map<String, Any?>>()
             var body: IrParam? = null
@@ -140,7 +141,7 @@ object OpenApi {
             }
 
             val resp = LinkedHashMap<String, Any?>()
-            resp["description"] = doc?.description ?: "OK"
+            resp["description"] = doc?.description ?: fn.apiDescription ?: "OK"
             val rt = fn.returnTypeRef
             if (rt != null && rt.simpleName !in setOf("Unit", "Void", "Nothing")) {
                 resp["content"] = linkedMapOf("application/json" to mediaType(schemaOf(rt), doc?.responseExample))

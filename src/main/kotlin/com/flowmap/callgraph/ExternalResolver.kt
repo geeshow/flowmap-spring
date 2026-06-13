@@ -103,6 +103,21 @@ class ExternalResolver(private val constEval: ConstantEvaluator) {
         return null to null
     }
 
+    /**
+     * Swagger/OpenAPI endpoint description, so a project documented with Swagger
+     * annotations yields the same endpoint descriptions as Spring REST Docs.
+     * Reads springdoc/OAS-v3 `@Operation(summary|description)` and the legacy
+     * springfox `@ApiOperation(value|notes)`. (Requires the swagger-annotations
+     * jar on the analysis classpath to resolve the annotation values.)
+     */
+    fun apiDescriptionOf(fn: FunctionDescriptor): String? {
+        for (ann in fn.annotations) when (shortName(ann)) {
+            "Operation" -> return ConstantEvaluator.firstStringArg(ann, "summary", "description")?.ifBlank { null }
+            "ApiOperation" -> return ConstantEvaluator.firstStringArg(ann, "value", "notes")?.ifBlank { null }
+        }
+        return null
+    }
+
     fun basePathOf(cls: ClassDescriptor): String? {
         for (ann in cls.annotations) {
             when (shortName(ann)) {

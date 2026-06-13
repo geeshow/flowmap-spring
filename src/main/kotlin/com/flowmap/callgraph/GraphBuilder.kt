@@ -117,11 +117,15 @@ class GraphBuilder(
             module = f.module,
             urlPlaceholder = null,
             clientPackage = null,
-            description = descriptionFor(verb, endpoint),
+            description = descriptionFor(verb, endpoint) ?: fn.apiDescription,
         )
     }
 
-    /** REST Docs description for a controller endpoint (verb-specific, else ANY). */
+    /**
+     * Endpoint description: REST Docs snippet (verb-specific, else ANY) takes
+     * precedence; callers fall back to the function's Swagger `@Operation`
+     * description so a Swagger-documented project gets the same enrichment.
+     */
     private fun descriptionFor(verb: String?, endpoint: String?): String? {
         if (descriptions.isEmpty() || endpoint == null) return null
         val np = RestDocs.normalize(endpoint)
