@@ -214,7 +214,10 @@ private fun cmdRefresh(opts: Opts) {
             "command" to "analyze", "project" to p.name, "nodes" to graph.nodes.size, "edges" to graph.edges.size)))
         val oapi = OpenApi.build(files, title = p.name, enrich = RestDocs.loadApi(snippets))
         File(outDir, "${p.name}.openapi.json").writeText(JsonOutput.writeValue(oapi))
-        System.err.println("  + ${p.name}: ${graph.nodes.size} nodes, ${graph.edges.size} edges")
+        @Suppress("UNCHECKED_CAST")
+        val pPaths = (oapi["paths"] as? Map<String, *>)?.size ?: 0
+        System.err.println("  + ${p.name}.json (${graph.nodes.size} nodes, ${graph.edges.size} edges)")
+        System.err.println("  + ${p.name}.openapi.json ($pPaths paths)")
     }
 
     // 3) prune ghost BACKEND outputs for projects no longer present/sourced.
@@ -256,8 +259,12 @@ private fun cmdRefresh(opts: Opts) {
     File(outDir, "_combined.json").writeText(JsonOutput.write(combined, linkedMapOf(
         "command" to "refresh/combine", "projects" to liveBases.toList(),
         "nodes" to combined.nodes.size, "edges" to combined.edges.size, "s2sEdges" to s2s, "gatewayEdges" to gw)))
+    System.err.println("  + _combined.json (${combined.nodes.size} nodes, ${combined.edges.size} edges, $s2s s2s, $gw gateway)")
     val allOapi = OpenApi.build(allFiles, title = opts["--title"] ?: "flowmap-all")
     File(outDir, "_openapi.json").writeText(JsonOutput.writeValue(allOapi))
+    @Suppress("UNCHECKED_CAST")
+    val paths = (allOapi["paths"] as? Map<String, *>)?.size ?: 0
+    System.err.println("  + _openapi.json ($paths paths)")
 
     // 5) per-project commit/impact — mine each project's git history against the
     // COMBINED graph (so cross-service breaking-change detection sees external
@@ -276,12 +283,13 @@ private fun cmdRefresh(opts: Opts) {
             File(outDir, "${p.name}.impact.json").writeText(JsonOutput.writeValue(result))
             impactCount++
             val breaking = result["breakingDeletionCount"]
-            System.err.println("  ! ${p.name}@$branch: ${commits.size} commits, ${result["changedNodeCount"]} changed nodes, $breaking breaking deletions")
+            System.err.println("  + ${p.name}.impact.json (@$branch: ${commits.size} commits, ${result["changedNodeCount"]} changed nodes, $breaking breaking deletions)")
         }
     }
 
     // 6) lightweight manifest (additive — leaves _combined.json and friends intact)
     val manifestCount = Manifest.write(outDir)
+    System.err.println("  + _manifest.json ($manifestCount projects)")
 
     // 7) optional sync: assemble the web app's data dir (ports scripts/sync-data.sh).
     //    Copies per-project artifacts from OUT_DIR + any --frontend-dir into
@@ -297,8 +305,6 @@ private fun cmdRefresh(opts: Opts) {
         System.err.println("  sync: ${r.copied} files copied, manifest.json with ${r.projects} projects -> ${dest.path}")
     }
 
-    @Suppress("UNCHECKED_CAST")
-    val paths = (allOapi["paths"] as? Map<String, *>)?.size ?: 0
     System.err.println("refresh done: ${liveBases.size} projects, combined ${combined.nodes.size} nodes / $s2s s2s, openapi $paths paths, impact $impactCount, manifest $manifestCount projects -> ${outDir.path}")
 }
 

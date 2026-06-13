@@ -36,14 +36,18 @@ object Sync {
             if (!src.isDirectory) { System.err.println("  sync: source dir missing: ${src.path}"); continue }
             if (src.canonicalFile == destC) { System.err.println("  sync: ${src.path} is the dest (already in place)"); continue }
             val files = src.listFiles { f -> isArtifact(f) }?.toList() ?: emptyList()
-            for (f in files) { f.copyTo(File(dest, f.name), overwrite = true); copied++ }
+            for (f in files) {
+                f.copyTo(File(dest, f.name), overwrite = true); copied++
+                System.err.println("    + ${f.name}")
+            }
             System.err.println("  sync: ${src.path} -> ${files.size} files")
         }
         // Drop legacy single-graph files BEFORE building the manifest — the manifest
         // is a disk scan, so `graph.json`/`openapi.json` left in place would be
         // mis-catalogued as projects named "graph"/"openapi".
-        LEGACY.forEach { File(dest, it).delete() }
+        LEGACY.forEach { val lf = File(dest, it); if (lf.delete()) System.err.println("    ~ removed legacy $it") }
         val projects = Manifest.write(dest, "manifest.json")
+        System.err.println("    + manifest.json ($projects projects)")
         return Result(copied, projects)
     }
 }
