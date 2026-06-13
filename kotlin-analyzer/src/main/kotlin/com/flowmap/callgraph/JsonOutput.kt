@@ -17,6 +17,14 @@ object JsonOutput {
     /** Pretty-print an arbitrary value (used for the OpenAPI document). */
     fun writeValue(value: Any?): String = mapper.writeValueAsString(value)
 
+    /** True if [text] parses as a node-link call graph (has a `nodes` array). */
+    fun isGraph(text: String): Boolean = try {
+        mapper.readTree(text)?.get("nodes")?.isArray == true
+    } catch (_: Exception) { false }
+
+    /** Like [read] but returns null for non-graph JSON (e.g. an OpenAPI doc). */
+    fun readOrNull(text: String): CallGraph? = if (isGraph(text)) read(text) else null
+
     /** Load a prebuilt graph.json back into a CallGraph (for search/stats --graph). */
     fun read(text: String): CallGraph {
         val root = mapper.readTree(text)

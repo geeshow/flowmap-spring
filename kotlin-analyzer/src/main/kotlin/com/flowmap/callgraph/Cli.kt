@@ -160,17 +160,22 @@ private fun cmdCombine(opts: Opts) {
         System.err.println("combine: provide --graphs a.json,b.json,... or --dir <dir of *.json>")
         exitProcess(2)
     }
-    val graphs = paths.map { JsonOutput.read(File(it).readText()) }
+    val usable = paths.filter { p ->
+        JsonOutput.isGraph(File(p).readText()).also {
+            if (!it) System.err.println("combine: skipping non-graph JSON ${File(p).name}")
+        }
+    }
+    val graphs = usable.map { JsonOutput.read(File(it).readText()) }
     val result = CrossRun.combine(graphs)
     val s2s = result.edges.count { it.kind == EdgeKind.S2S }
     val meta = linkedMapOf<String, Any?>(
         "command" to "combine",
-        "inputs" to paths.map { File(it).name },
+        "inputs" to usable.map { File(it).name },
         "projects" to result.nodes.mapNotNull { it.project }.distinct().sorted(),
         "nodes" to result.nodes.size, "edges" to result.edges.size, "s2sEdges" to s2s,
     )
     dump(result, opts["--out"], meta)
-    System.err.println("combined ${paths.size} graphs: ${result.nodes.size} nodes, ${result.edges.size} edges, $s2s s2s")
+    System.err.println("combined ${usable.size} graphs: ${result.nodes.size} nodes, ${result.edges.size} edges, $s2s s2s")
 }
 
 /** Graph inputs for `combine`: explicit `--graphs` CSV, and/or every `*.json` under `--dir`. */
@@ -178,9 +183,14 @@ private fun collectGraphPaths(opts: Opts): List<String> {
     val out = LinkedHashSet<String>()
     opts["--graphs"]?.split(",")?.map { it.trim() }?.filter { it.isNotEmpty() }?.forEach { out.add(it) }
     opts["--dir"]?.let { dir ->
-        // skip "_*.json" so a prior combine output (e.g. _combined.json) isn't re-ingested
-        File(dir).listFiles { f -> f.isFile && f.name.endsWith(".json") && !f.name.startsWith("_") }
-            ?.sortedBy { it.name }?.forEach { out.add(it.path) }
+        // Only ingest call-graph JSONs: skip "_*.json" (prior combine output like
+        // _combined.json) and sibling artifacts that share the dir but aren't graphs
+        // (*.openapi.json, *.impact.json). A defensive non-graph check in cmdCombine
+        // also drops anything that slips through.
+        File(dir).listFiles { f ->
+            f.isFile && f.name.endsWith(".json") && !f.name.startsWith("_") &&
+                !f.name.endsWith(".openapi.json") && !f.name.endsWith(".impact.json")
+        }?.sortedBy { it.name }?.forEach { out.add(it.path) }
     }
     return out.toList()
 }
