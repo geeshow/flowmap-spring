@@ -6,9 +6,9 @@ import java.io.File
  * Port of `flowmap/scripts/sync-data.sh` — assembles the web app's data directory
  * from one or more analyzer output dirs:
  *   1. copy every per-project artifact (`<p>.json` / `.openapi.json` / `.impact.json`
- *      / `.join.json` / `.screens.json`) from each source into [dest], EXCLUDING the
- *      `_*` aggregates (`_combined.json`, `_openapi.json`, `_manifest.json`) and the
- *      app manifest itself;
+ *      / `.pulls.json` + the `<p>.pulls/` lazy-load shard dir / `.join.json` /
+ *      `.screens.json`) from each source into [dest], EXCLUDING the `_*` aggregates
+ *      (`_combined.json`, `_openapi.json`, `_manifest.json`) and the app manifest itself;
  *   2. (re)build the app-facing `manifest.json` by scanning [dest] — [Manifest]
  *      detects backend vs frontend by node layers and links the siblings that
  *      actually exist on disk, so a merged dir is catalogued correctly without
@@ -31,9 +31,12 @@ object Sync {
     private fun isArtifact(f: File): Boolean =
         f.isFile && f.name.endsWith(".json") && !f.name.startsWith("_") && f.name != "manifest.json"
 
+    /** A `<project>.pulls/` directory of lazy-loaded per-PR file-diff shards. */
+    private fun isShardDir(f: File): Boolean = f.isDirectory && f.name.endsWith(".pulls")
+
     /** Project base name of an artifact (strips the graph/sibling suffix). */
     private fun baseOf(name: String): String = name
-        .removeSuffix(".openapi.json").removeSuffix(".impact.json")
+        .removeSuffix(".openapi.json").removeSuffix(".impact.json").removeSuffix(".pulls.json")
         .removeSuffix(".join.json").removeSuffix(".screens.json").removeSuffix(".json")
 
     fun run(sources: List<File>, dest: File): Result {
@@ -48,7 +51,18 @@ object Sync {
                 f.copyTo(File(dest, f.name), overwrite = true); copied++
                 System.err.println("    + ${f.name}")
             }
-            System.err.println("  sync: ${src.path} -> ${files.size} files")
+            // Lazy-load PR shard dirs: mirror each `<project>.pulls/` (drop then copy) so
+            // the index's `file` refs resolve and stale shards inside don't linger.
+            val shardDirs = src.listFiles { f -> isShardDir(f) }?.toList() ?: emptyList()
+            for (d in shardDirs) {
+                val target = File(dest, d.name)
+                target.deleteRecursively()
+                d.copyRecursively(target, overwrite = true)
+                val n = d.listFiles { f -> f.isFile }?.size ?: 0
+                copied += n
+                System.err.println("    + ${d.name}/ ($n shards)")
+            }
+            System.err.println("  sync: ${src.path} -> ${files.size} files, ${shardDirs.size} shard dirs")
         }
         // Clean up BEFORE building the manifest (a disk scan), so stale files aren't
         // mis-catalogued or served:
@@ -64,6 +78,16 @@ object Sync {
         dest.listFiles { f -> isArtifact(f) }?.forEach { f ->
             if (f.name in sourceNames) return@forEach          // freshly synced — keep
             if (baseOf(f.name) in syncedGraphBases && f.delete()) System.err.println("    ~ pruned stale ${f.name}")
+        }
+        // Same stale rule for `<project>.pulls/` shard dirs: drop one whose project graph
+        // was synced this run but which no source provided (so it isn't served stale).
+        val sourceShardDirs = sources.filter { it.isDirectory }
+            .flatMap { it.listFiles { f -> isShardDir(f) }?.toList() ?: emptyList() }
+            .map { it.name }.toSet()
+        dest.listFiles { f -> isShardDir(f) }?.forEach { d ->
+            if (d.name in sourceShardDirs) return@forEach       // freshly mirrored — keep
+            if (d.name.removeSuffix(".pulls") in syncedGraphBases && d.deleteRecursively())
+                System.err.println("    ~ pruned stale ${d.name}/")
         }
         val projects = Manifest.write(dest, "manifest.json")
         System.err.println("    + manifest.json ($projects projects)")

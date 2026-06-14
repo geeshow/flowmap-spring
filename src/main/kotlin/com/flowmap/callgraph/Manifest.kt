@@ -45,6 +45,7 @@ object Manifest {
             f.isFile && f.name.endsWith(".json") && !f.name.startsWith("_") &&
                 f.name != "manifest.json" &&  // app-facing manifest, not a project graph
                 !f.name.endsWith(".openapi.json") && !f.name.endsWith(".impact.json") &&
+                !f.name.endsWith(".pulls.json") &&
                 !f.name.endsWith(".join.json") && !f.name.endsWith(".screens.json")
         }?.sortedBy { it.name } ?: emptyList()
 
@@ -84,6 +85,7 @@ object Manifest {
             "graph" to graphFile.name,
             "openapi" to sibling("openapi.json"),
             "impact" to sibling("impact.json"),
+            "pulls" to sibling("pulls.json"),
             "join" to sibling("join.json"),
             "screens" to sibling("screens.json"),
             "nodes" to nodes,
