@@ -327,47 +327,70 @@ private fun cmdRefresh(opts: Opts) {
     val paths = (allOapi["paths"] as? Map<String, *>)?.size ?: 0
     System.err.println("  + _openapi.json ($paths paths)")
 
-    // 5) per-project commit/impact — mine each project's git history against the
+    // 5) per-project PR analysis — mine each project's merged PRs against the
     // COMBINED graph (so cross-service breaking-change detection sees external
-    // callers). Projects without a git work tree are skipped.
+    // callers): impact (changed/deleted nodes + breaking endpoints) plus the
+    // lazy-loaded per-PR file diffs. Each project logs its step and a ✓/✗/· status
+    // (success / failure / skipped) so a no-op run is self-explaining; a single
+    // project's failure is isolated (caught) and never aborts the whole refresh.
     var impactCount = 0
-    if (!opts.has("--no-impact")) {
+    if (opts.has("--no-impact")) {
+        System.err.println("[5/7] PR analysis: skipped (--no-impact)")
+    } else {
         val impactMax = opts["--impact-max"]?.toIntOrNull() ?: 50
         val impactDepth = opts["--impact-depth"]?.toIntOrNull() ?: 3
+        val candidates = projects.count { it.name in liveBases }
+        System.err.println("[5/7] PR analysis (impact + pull-files): $candidates/${projects.size} project(s) with backend sources, max=$impactMax depth=$impactDepth")
+        var skipped = 0; var failed = 0
         for (p in projects) {
-            if (p.name !in liveBases) continue
-            if (!GitLog.isRepoRoot(p)) { System.err.println("  - ${p.name}: (not a standalone git repo, skip impact)"); continue }
-            val branch = GitLog.resolveBranch(p, opts["--branch"])
-            if (branch == null) { System.err.println("  - ${p.name}: (no default branch, skip impact)"); continue }
-            val pulls = GitHub.mergedPulls(p, branch, impactMax)
-            val impactFile = File(outDir, "${p.name}.impact.json")
+            if (p.name !in liveBases) continue        // non-backend dir (e.g. frontend) — already reported in step 2
+            val isRoot = GitLog.isRepoRoot(p)
+            val branch = if (isRoot) GitLog.resolveBranch(p, opts["--branch"]) else null
             when {
-                pulls == null ->                       // gh unavailable: keep any prior impact, don't overwrite/delete
-                    System.err.println("  - ${p.name}: (gh unavailable for base $branch, keeping existing impact)")
-                pulls.isEmpty() -> {                   // gh ran, no merged PRs: drop stale impact + pull-files so they aren't served
-                    val rmImpact = impactFile.delete()
-                    val rmPulls = removePullFiles(outDir, p.name)
-                    System.err.println("  - ${p.name}: (no merged PRs for base $branch, skip impact)" +
-                        if (rmImpact || rmPulls) " — removed stale artifacts" else "")
-                }
+                !isRoot -> { System.err.println("  · ${p.name}: skip — not a standalone git repo"); skipped++ }
+                branch == null -> { System.err.println("  · ${p.name}: skip — no default branch (try --branch)"); skipped++ }
                 else -> {
-                    val result = Impact.analyze(p, branch, pulls, combined, impactDepth)
-                    impactFile.writeText(JsonOutput.writeValue(result))
-                    impactCount++
-                    val breaking = result["breakingDeletionCount"]
-                    System.err.println("  + ${p.name}.impact.json (base $branch: ${pulls.size} PRs, ${result["changedNodeCount"]} changed nodes, $breaking breaking deletions)")
-
-                    // Separate artifact: per-PR file-level diffs (status + patch) via gh api,
-                    // reusing the PR list just fetched. Split into a light `<project>.pulls.json`
-                    // index + heavy `<project>.pulls/<number>.json` shards (lazy-loaded on demand),
-                    // kept out of impact.json. One extra `gh api` call per PR — skip --no-pull-files.
-                    if (!opts.has("--no-pull-files")) {
-                        val (fetched, reused) = writePullFiles(outDir, p.name, p, branch, pulls, opts.has("--refetch-pull-files"))
-                        System.err.println("  + ${p.name}.pulls.json (index, ${fetched + reused} PRs) — $fetched fetched, $reused reused in ${p.name}.pulls/")
+                    System.err.println("  → ${p.name}@$branch: fetching merged PRs via gh (max $impactMax)…")
+                    val pulls = GitHub.mergedPulls(p, branch, impactMax)
+                    val impactFile = File(outDir, "${p.name}.impact.json")
+                    when {
+                        pulls == null -> {             // gh unavailable: keep any prior impact, don't overwrite/delete
+                            System.err.println("  ✗ ${p.name}: gh unavailable for base $branch (installed? authed? remote? base?) — keeping existing impact")
+                            failed++
+                        }
+                        pulls.isEmpty() -> {           // gh ran, no merged PRs: drop stale impact + pull-files so they aren't served
+                            val rm = impactFile.delete() or removePullFiles(outDir, p.name)
+                            System.err.println("  · ${p.name}: no merged PRs for base $branch — skip" + if (rm) " (removed stale artifacts)" else "")
+                            skipped++
+                        }
+                        else -> {
+                            val ok = try {
+                                System.err.println("  → ${p.name}: ${pulls.size} PRs — analyzing impact (depth $impactDepth)…")
+                                val result = Impact.analyze(p, branch, pulls, combined, impactDepth)
+                                impactFile.writeText(JsonOutput.writeValue(result))
+                                impactCount++
+                                System.err.println("  ✓ ${p.name}.impact.json (${pulls.size} PRs, ${result["changedNodeCount"]} changed nodes, ${result["breakingDeletionCount"]} breaking deletions)")
+                                true
+                            } catch (e: Exception) {
+                                System.err.println("  ✗ ${p.name}: impact analysis FAILED — ${e.message}")
+                                failed++; false
+                            }
+                            // pull-files is best-effort: a failure here does NOT fail the project (impact already succeeded)
+                            if (ok && !opts.has("--no-pull-files")) {
+                                try {
+                                    System.err.println("  → ${p.name}: collecting per-PR file diffs (status+patch) via gh…")
+                                    val (fetched, reused) = writePullFiles(outDir, p.name, p, branch, pulls, opts.has("--refetch-pull-files"))
+                                    System.err.println("  ✓ ${p.name}.pulls.json (${fetched + reused} PRs: $fetched fetched, $reused reused) → ${p.name}.pulls/")
+                                } catch (e: Exception) {
+                                    System.err.println("  ⚠ ${p.name}: pull-files collection failed — ${e.message} (impact kept)")
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
+        System.err.println("[5/7] PR analysis done: $impactCount analyzed, $skipped skipped, $failed failed")
     }
 
     // 6) lightweight manifest (additive — leaves _combined.json and friends intact)
