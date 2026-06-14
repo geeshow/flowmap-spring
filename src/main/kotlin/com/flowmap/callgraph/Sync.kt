@@ -13,7 +13,10 @@ import java.io.File
  *      detects backend vs frontend by node layers and links the siblings that
  *      actually exist on disk, so a merged dir is catalogued correctly without
  *      merging the per-analyzer `_manifest.json` files by hand;
- *   3. delete the legacy single-graph files the manifest replaces.
+ *   3. delete legacy single-graph files, DEPARTED projects (graph whose base is gone
+ *      from every source — removed or renamed, e.g. whole-repo `graph` → per-root
+ *      `graph-<root>`; type-scoped so a partial sync can't wipe the other side), and
+ *      stale siblings/shard-dirs of still-present projects.
  *
  * The shell merged two analyzers' `_manifest.json`; scanning [dest] after the copy
  * is equivalent and self-consistent (no orphan entries possible — every listed
@@ -33,6 +36,18 @@ object Sync {
 
     /** A `<project>.pulls/` directory of lazy-loaded per-PR file-diff shards. */
     private fun isShardDir(f: File): Boolean = f.isDirectory && f.name.endsWith(".pulls")
+
+    /**
+     * Delete an artifact AND its optional gzip companion (`<f>.gz`, written by the web
+     * build's compression step), logging each removal with [why]. Keeping the `.gz`
+     * paired with the `.json` is what prevents a pruned project from lingering as a
+     * still-served compressed orphan.
+     */
+    private fun pruneArtifact(f: File, why: String) {
+        if (f.delete()) System.err.println("    ~ $why ${f.name}")
+        val gz = File(f.path + ".gz")
+        if (gz.delete()) System.err.println("    ~ $why ${gz.name}")
+    }
 
     /** Project base name of an artifact (strips the graph/sibling suffix). */
     private fun baseOf(name: String): String = name
@@ -66,24 +81,46 @@ object Sync {
         }
         // Clean up BEFORE building the manifest (a disk scan), so stale files aren't
         // mis-catalogued or served:
-        //  1) legacy bare single-graph files the manifest replaces, and
-        //  2) stale siblings of a SYNCED project — e.g. `<p>.impact.json` left over
-        //     when `<p>` no longer has impact this run. Scoped to projects whose graph
-        //     IS in a source, so frontend artifacts survive a backend-only sync.
+        //  1) legacy bare single-graph files the manifest replaces;
+        //  2) DEPARTED projects — a dest graph whose base is gone from every source
+        //     because the project was removed or RENAMED (e.g. a whole-repo `graph`
+        //     split into per-root `graph-<root>`, leaving the old `graph.*` behind).
+        //     Type-scoped: only pruned when a graph of the SAME type (frontend/backend)
+        //     was synced this run, so a partial (e.g. backend-only) sync never wipes
+        //     the other side;
+        //  3) stale siblings/shard-dirs of a STILL-present project — e.g. `<p>.impact.json`
+        //     left over when `<p>` has no impact this run.
         LEGACY.forEach { val lf = File(dest, it); if (lf.delete()) System.err.println("    ~ removed legacy $it") }
-        val sourceNames = sources.filter { it.isDirectory }
-            .flatMap { it.listFiles { f -> isArtifact(f) }?.toList() ?: emptyList() }
-            .map { it.name }.toSet()
+        val liveDirs = sources.filter { it.isDirectory }
+        val sourceArtifacts = liveDirs.flatMap { it.listFiles { f -> isArtifact(f) }?.toList() ?: emptyList() }
+        val sourceNames = sourceArtifacts.map { it.name }.toSet()
+        val sourceBases = sourceArtifacts.mapTo(HashSet()) { baseOf(it.name) }       // every project present in a source
         val syncedGraphBases = sourceNames.filter { it == "${baseOf(it)}.json" }.map { baseOf(it) }.toSet()
+        val sourceShardDirs = liveDirs.flatMap { it.listFiles { f -> isShardDir(f) }?.toList() ?: emptyList() }
+            .map { it.name }.toSet()
+        // Which graph TYPES were synced this run? (a source graph is `<base>.json`.)
+        val sourceGraphs = sourceArtifacts.filter { it.name == "${baseOf(it.name)}.json" }
+        val syncedFrontend = sourceGraphs.any { Manifest.isFrontendGraph(it) }
+        val syncedBackend = sourceGraphs.any { !Manifest.isFrontendGraph(it) }
+
+        // (2) departed-project prune: graph + all siblings + shard dir, type-scoped.
+        dest.listFiles { f -> isArtifact(f) && f.name == "${baseOf(f.name)}.json" }?.forEach { g ->
+            val base = baseOf(g.name)
+            if (base in sourceBases) return@forEach                       // still present (graph or a sibling) — keep
+            val frontend = Manifest.isFrontendGraph(g)
+            if (!(frontend && syncedFrontend || !frontend && syncedBackend)) return@forEach  // type not synced — leave it
+            val kind = if (frontend) "frontend" else "backend"
+            dest.listFiles { f -> isArtifact(f) && baseOf(f.name) == base }?.forEach { pruneArtifact(it, "pruned departed $kind") }
+            File(dest, "$base.pulls").takeIf { it.isDirectory }?.let {
+                if (it.deleteRecursively()) System.err.println("    ~ pruned departed $kind $base.pulls/")
+            }
+        }
+        // (3a) stale-sibling prune: sibling of a still-present graph not re-synced this run.
         dest.listFiles { f -> isArtifact(f) }?.forEach { f ->
             if (f.name in sourceNames) return@forEach          // freshly synced — keep
-            if (baseOf(f.name) in syncedGraphBases && f.delete()) System.err.println("    ~ pruned stale ${f.name}")
+            if (baseOf(f.name) in syncedGraphBases) pruneArtifact(f, "pruned stale")
         }
-        // Same stale rule for `<project>.pulls/` shard dirs: drop one whose project graph
-        // was synced this run but which no source provided (so it isn't served stale).
-        val sourceShardDirs = sources.filter { it.isDirectory }
-            .flatMap { it.listFiles { f -> isShardDir(f) }?.toList() ?: emptyList() }
-            .map { it.name }.toSet()
+        // (3b) same stale rule for `<project>.pulls/` shard dirs of still-present graphs.
         dest.listFiles { f -> isShardDir(f) }?.forEach { d ->
             if (d.name in sourceShardDirs) return@forEach       // freshly mirrored — keep
             if (d.name.removeSuffix(".pulls") in syncedGraphBases && d.deleteRecursively())
