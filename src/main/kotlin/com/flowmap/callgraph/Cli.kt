@@ -68,7 +68,7 @@ private class Opts(
 private fun parseOpts(args: List<String>): Opts {
     val flags = HashMap<String, String>()
     val bools = HashSet<String>()
-    val boolNames = setOf("--include-other", "--no-pull", "--no-impact", "--public-only")
+    val boolNames = setOf("--include-other", "--no-pull", "--no-impact", "--no-pull-files", "--refetch-pull-files", "--public-only")
     var i = 0
     while (i < args.size) {
         val a = args[i]
@@ -181,6 +181,57 @@ private fun cmdAnalyze(opts: Opts) {
     dump(graph, opts["--out"], meta)
 }
 
+/**
+ * Write the split PR file-diffs for one project: a light `<project>.pulls.json`
+ * index plus one heavy `<project>.pulls/<number>.json` shard per PR (lazy-loaded
+ * on demand).
+ *
+ * INCREMENTAL: a merged PR's files are immutable, so a PR whose shard already
+ * exists on disk is REUSED as-is — no `gh api` call — and only NEW PRs are
+ * fetched. Pass [refetch] = true to re-fetch every PR regardless. Stale shards
+ * (PRs no longer in the window) are pruned. Returns (fetched, reused) counts.
+ */
+private fun writePullFiles(outDir: File, project: String, repo: File, branch: String,
+                           pulls: List<GitHub.Pr>, refetch: Boolean): Pair<Int, Int> {
+    val shardDirName = "$project.pulls"
+    val shardDir = File(outDir, shardDirName).also { it.mkdirs() }
+    val webBase = GitLog.webBaseUrl(repo)
+    val entries = ArrayList<Map<String, Any?>>()
+    val keep = HashSet<String>()
+    var fetched = 0; var reused = 0
+    for (pr in pulls) {
+        val shardFile = File(shardDir, "${pr.number}.json")
+        // reuse an already-collected PR (immutable) unless a refetch is forced
+        var shard: Map<String, Any?>? =
+            if (!refetch && shardFile.isFile) GitHub.readShard(shardFile)?.also { reused++ } else null
+        if (shard == null) {                                   // new PR (or forced/unreadable): fetch via gh
+            val files = GitHub.pullFiles(repo, pr.number)
+            if (files == null) {                               // gh failed: preserve any prior shard, don't prune it
+                if (shardFile.isFile) {
+                    keep.add(shardFile.name)
+                    GitHub.readShard(shardFile)?.let { entries.add(GitHub.indexEntry(it, shardDirName)) }
+                }
+                continue
+            }
+            shard = GitHub.buildShard(pr, files, webBase)
+            shardFile.writeText(JsonOutput.writeValue(shard)); fetched++
+        }
+        keep.add(shardFile.name)
+        entries.add(GitHub.indexEntry(shard, shardDirName))
+    }
+    shardDir.listFiles { f -> f.isFile && f.name.endsWith(".json") }?.forEach { if (it.name !in keep) it.delete() }
+    File(outDir, "$project.pulls.json").writeText(JsonOutput.writeValue(
+        GitHub.pullIndexDoc(branch, webBase, shardDirName, entries)))
+    return fetched to reused
+}
+
+/** Remove a project's PR file-diff artifacts: the `<project>.pulls.json` index and `<project>.pulls/` shard dir. */
+private fun removePullFiles(outDir: File, project: String): Boolean {
+    val idx = File(outDir, "$project.pulls.json").delete()
+    val dir = File(outDir, "$project.pulls").takeIf { it.isDirectory }?.deleteRecursively() ?: false
+    return idx || dir
+}
+
 private fun cmdRefresh(opts: Opts) {
     val repo = File(opts["--repo"] ?: DEFAULT_REPO)
     val outDir = File(opts["--out-dir"] ?: "./json").also { it.mkdirs() }
@@ -232,11 +283,16 @@ private fun cmdRefresh(opts: Opts) {
         f.isFile && f.name.endsWith(".json") && !f.name.startsWith("_") && f.name != "manifest.json" &&
             !f.name.endsWith(".join.json") && !f.name.endsWith(".screens.json")
     }?.forEach { f ->
-        val isBackendSibling = f.name.endsWith(".openapi.json") || f.name.endsWith(".impact.json")
-        val base = f.name.removeSuffix(".impact.json").removeSuffix(".openapi.json").removeSuffix(".json")
+        val isBackendSibling = f.name.endsWith(".openapi.json") || f.name.endsWith(".impact.json") || f.name.endsWith(".pulls.json")
+        val base = f.name.removeSuffix(".impact.json").removeSuffix(".openapi.json").removeSuffix(".pulls.json").removeSuffix(".json")
         if (base in liveBases) return@forEach
         if (!isBackendSibling && Manifest.isFrontendGraph(f)) return@forEach  // a frontend graph, not a ghost
         f.delete(); System.err.println("  ~ pruned ghost ${f.name}")
+    }
+    // also prune ghost PR-shard directories (`<project>.pulls/`) for absent projects
+    outDir.listFiles { f -> f.isDirectory && f.name.endsWith(".pulls") }?.forEach { d ->
+        if (d.name.removeSuffix(".pulls") !in liveBases && d.deleteRecursively())
+            System.err.println("  ~ pruned ghost ${d.name}/")
     }
 
     // 4) combine (in-memory) + repo-wide OpenAPI.
@@ -288,15 +344,27 @@ private fun cmdRefresh(opts: Opts) {
             when {
                 pulls == null ->                       // gh unavailable: keep any prior impact, don't overwrite/delete
                     System.err.println("  - ${p.name}: (gh unavailable for base $branch, keeping existing impact)")
-                pulls.isEmpty() ->                     // gh ran, no merged PRs: drop stale impact so it isn't served
+                pulls.isEmpty() -> {                   // gh ran, no merged PRs: drop stale impact + pull-files so they aren't served
+                    val rmImpact = impactFile.delete()
+                    val rmPulls = removePullFiles(outDir, p.name)
                     System.err.println("  - ${p.name}: (no merged PRs for base $branch, skip impact)" +
-                        if (impactFile.delete()) " — removed stale ${p.name}.impact.json" else "")
+                        if (rmImpact || rmPulls) " — removed stale artifacts" else "")
+                }
                 else -> {
                     val result = Impact.analyze(p, branch, pulls, combined, impactDepth)
                     impactFile.writeText(JsonOutput.writeValue(result))
                     impactCount++
                     val breaking = result["breakingDeletionCount"]
                     System.err.println("  + ${p.name}.impact.json (base $branch: ${pulls.size} PRs, ${result["changedNodeCount"]} changed nodes, $breaking breaking deletions)")
+
+                    // Separate artifact: per-PR file-level diffs (status + patch) via gh api,
+                    // reusing the PR list just fetched. Split into a light `<project>.pulls.json`
+                    // index + heavy `<project>.pulls/<number>.json` shards (lazy-loaded on demand),
+                    // kept out of impact.json. One extra `gh api` call per PR — skip --no-pull-files.
+                    if (!opts.has("--no-pull-files")) {
+                        val (fetched, reused) = writePullFiles(outDir, p.name, p, branch, pulls, opts.has("--refetch-pull-files"))
+                        System.err.println("  + ${p.name}.pulls.json (index, ${fetched + reused} PRs) — $fetched fetched, $reused reused in ${p.name}.pulls/")
+                    }
                 }
             }
         }
@@ -386,6 +454,14 @@ private fun cmdImpact(opts: Opts) {
     } else {
         println(text)
     }
+    // Optional separate artifact: per-PR file-level diffs (status + patch) via gh api,
+    // split into a light `<project>.pulls.json` index + `<project>.pulls/<number>.json`
+    // shards under the given output dir (lazy-loaded on demand).
+    opts["--pull-files"]?.let { pfDir ->
+        val dir = File(pfDir).also { it.mkdirs() }
+        val (fetched, reused) = writePullFiles(dir, git.name, git, branch, pulls, opts.has("--refetch-pull-files"))
+        System.err.println("wrote ${git.name}.pulls.json (index, ${fetched + reused} PRs) — $fetched fetched, $reused reused in ${git.name}.pulls/ under ${dir.path}")
+    }
 }
 
 private fun cmdCombine(opts: Opts) {
@@ -443,7 +519,7 @@ private fun collectGraphPaths(opts: Opts): List<String> {
         // also drops anything that slips through.
         File(dir).listFiles { f ->
             f.isFile && f.name.endsWith(".json") && !f.name.startsWith("_") && f.name != "manifest.json" &&
-                !f.name.endsWith(".openapi.json") && !f.name.endsWith(".impact.json")
+                !f.name.endsWith(".openapi.json") && !f.name.endsWith(".impact.json") && !f.name.endsWith(".pulls.json")
         }?.sortedBy { it.name }?.forEach { out.add(it.path) }
     }
     return out.toList()
@@ -509,8 +585,10 @@ private fun usage() {
           refresh — ONE-SHOT: pull every project + run ALL analyses (graph + openapi + restdocs + impact)
                     + combine (auto-discovers gateways from spring.cloud.gateway.routes) + manifest
                     + optional sync (assemble the web app's data dir; ports sync-data.sh)
-            refresh [--repo <dir>] [--out-dir ./json] [--no-pull] [--no-impact]
+            refresh [--repo <dir>] [--out-dir ./json] [--no-pull] [--no-impact] [--no-pull-files] [--refetch-pull-files]
                     [--impact-max N] [--impact-depth N] [--branch b]
+                    # --no-pull-files: skip per-PR file diffs (status+patch) -> <project>.pulls.json + <project>.pulls/<n>.json
+                    # incremental by default: PRs with an existing shard are reused (no gh call); --refetch-pull-files forces re-fetch
                     [--include-other] [--public-only] [--profile p] [--props kv.txt] [--title T]
                     [--gateway-routes routes.yml] [--gateway-name N]   # explicit gateway (else auto-discovered)
                     [--sync-dir <web data dir>] [--frontend-dir d1,d2] # copy per-project artifacts + manifest.json there
@@ -519,8 +597,9 @@ private fun usage() {
           --- single-analysis tools (debugging / ad-hoc) ---
           analyze --repo <dir> [--project P] [--out f.json] [--include-other] [--public-only] [--profile p] [--props kv.txt] [--restdocs dir]
           openapi --repo <dir> [--project P] [--out f.json] [--restdocs dir] [--title T] [--api-version V] [--profile p] [--props kv.txt]
-          impact  --git <repo> (--graph g.json | --repo <dir> --project P) [--branch b] [--max N] [--depth N] [--out f.json]
+          impact  --git <repo> (--graph g.json | --repo <dir> --project P) [--branch b] [--max N] [--depth N] [--out f.json] [--pull-files <dir>] [--refetch-pull-files]
                   # change-impact per merged PR (via `gh`, base = --branch or current); needs gh auth + a GitHub remote
+                  # --pull-files <dir>: also write a <project>.pulls.json index + <project>.pulls/<number>.json shards (lazy-load, incremental)
           combine --graphs a.json,b.json,... | --dir <dir of *.json> [--gateway-routes routes.yml] [--gateway-name N] [--out f.json]
           search  --method M [--graph g.json | --repo <dir>] [--direction both|callers|callees] [--depth N] [--out f]
           stats   [--graph g.json | --repo <dir>] [--project P] [--profile p]
