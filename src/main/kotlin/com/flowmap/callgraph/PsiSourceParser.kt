@@ -55,8 +55,10 @@ class PsiSourceParser : AutoCloseable {
         kt.collectDescendantsOfType<KtClassOrObject>().forEach { cls ->
             val fqcn = (cls.fqName?.asString() ?: cls.name ?: return@forEach).removeSuffix(".Companion")
             val annNames = cls.annotationEntries.mapNotNull { it.shortName?.asString() }.toSet()
-            val isController = ("RestController" in annNames || "Controller" in annNames) &&
-                "FeignClient" !in annNames && "HttpExchange" !in annNames
+            // Endpoints are detected by the method's own @*Mapping — so a @Service that
+            // serves HTTP is treated as a controller too. Only outbound @FeignClient/
+            // @HttpExchange clients are excluded (their methods use @*Exchange anyway).
+            val isExternalClient = "FeignClient" in annNames || "HttpExchange" in annNames
             val basePath = cls.annotationEntries
                 .firstOrNull { it.shortName?.asString() == "RequestMapping" || it.shortName?.asString() == "HttpExchange" }
                 ?.let { annStringArg(it, "value", "path", "url") }
@@ -65,7 +67,7 @@ class PsiSourceParser : AutoCloseable {
                 val r = fn.textRange ?: return@forEach
                 var verb: String? = null
                 var ep: String? = null
-                if (isController) {
+                if (!isExternalClient) {
                     for (ae in fn.annotationEntries) {
                         val v = Classify.MAPPING_VERBS[ae.shortName?.asString()] ?: continue
                         verb = v; ep = compose(basePath, annStringArg(ae, "value", "path")); break
