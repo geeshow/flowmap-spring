@@ -33,9 +33,10 @@ object CrossRun {
         val newEdges = LinkedHashMap<List<Any?>, CallEdge>()
         for (e in srcEdges.values) {
             val ext = externals[e.target]
+            val caller = nodes[e.source]
             val provider = ext?.let {
                 if (it.endpoint.isNullOrEmpty()) null
-                else matchProvider(providers, it.httpMethod, it.endpoint, hintTokens(it), nodes[e.source]?.project)
+                else matchProvider(providers, it.httpMethod, it.endpoint, hintTokens(it), caller?.project, caller?.module)
             }
             val ne = if (provider != null) e.copy(target = provider.id, kind = EdgeKind.S2S) else e
             newEdges.putIfAbsent(ne.key(), ne)
@@ -104,15 +105,29 @@ object CrossRun {
         path: String?,
         hints: List<String>,
         callerProject: String?,
+        callerModule: String?,
     ): MethodNode? {
         val np = normPath(path)
         if (np.isEmpty()) return null
+        // A provider is a valid S2S target if it lives in a different deployable unit than
+        // the caller. Across projects that means a different project; within a single
+        // multi-module project (services-as-modules) it means a different module.
         val cands = providers.filter {
-            normPath(it.endpoint) == np && verbOk(it.httpMethod, verb) && it.project != callerProject
+            normPath(it.endpoint) == np && verbOk(it.httpMethod, verb) &&
+                (it.project != callerProject || (callerModule != null && it.module != callerModule))
         }
         if (cands.isEmpty()) return null
-        cands.firstOrNull { projectMatchesHint(it.project, hints) }?.let { return it }
+        // Prefer a provider the call's service hint points at (Feign name / url placeholder),
+        // then a cross-project provider, then the first remaining candidate.
+        cands.firstOrNull { projectMatchesHint(it.project, hints) || moduleMatchesHint(it.module, hints) }?.let { return it }
+        cands.firstOrNull { it.project != callerProject }?.let { return it }
         return cands.first()
+    }
+
+    private fun moduleMatchesHint(module: String?, tokens: List<String>): Boolean {
+        if (module == null || tokens.isEmpty()) return false
+        val m = module.lowercase().filter(Char::isLetterOrDigit)
+        return tokens.any { it == m || m.contains(it) || it.contains(m) }
     }
 
     /** `/users/{id}` == `/users/{userNo}`; drop query + trailing slash. Mirrors registry.norm_path. */

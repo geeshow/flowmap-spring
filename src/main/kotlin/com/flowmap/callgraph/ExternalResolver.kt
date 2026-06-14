@@ -152,7 +152,15 @@ class ExternalResolver(private val constEval: ConstantEvaluator) {
     }
 
     private fun httpVerbInChain(callExpr: KtCallExpression): String? {
-        val text = callExpr.text
+        // Walk up to the outermost fluent-chain expression so receiver-side verb
+        // methods (`webClient.get()...`) are visible, not just this call's own text.
+        var top: org.jetbrains.kotlin.psi.KtExpression = callExpr
+        var p = callExpr.parent
+        while (p is org.jetbrains.kotlin.psi.KtDotQualifiedExpression || p is KtCallExpression) {
+            (p as? org.jetbrains.kotlin.psi.KtExpression)?.let { top = it }
+            p = p.parent
+        }
+        val text = top.text
         return listOf(
             "RequestEntity.post" to "POST", "RequestEntity.get" to "GET",
             "RequestEntity.put" to "PUT", "RequestEntity.delete" to "DELETE",
