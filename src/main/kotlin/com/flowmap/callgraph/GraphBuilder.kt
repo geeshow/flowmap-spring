@@ -54,11 +54,18 @@ class GraphBuilder(
     // ---- classification ----
 
     private fun layerOf(t: IrType): Layer {
-        for (ann in t.annotationSimpleNames) Classify.LAYER_ANNOTATIONS[ann]?.let { return it }
+        // An explicit controller stereotype always wins.
+        if ("RestController" in t.annotationSimpleNames || "Controller" in t.annotationSimpleNames) return Layer.CONTROLLER
         // Declarative HTTP clients (@FeignClient / @HttpExchange) are external — their
         // calls become `ext:` nodes; tracking the interface declaration too would emit
-        // a duplicate OTHER node for the same client.
+        // a duplicate OTHER node for the same client. (Checked before the @*Mapping rule
+        // so a client's @*Exchange methods never read as server endpoints.)
         if (t.isFeign || t.isHttpExchange) return Layer.EXTERNAL
+        // A class that SERVES HTTP endpoints (@*Mapping methods) is a controller, even
+        // when stereotyped @Service/@Component — classify by behavior, not annotation.
+        if (t.functions.any { Classify.hasServerMapping(it.annotationSimpleNames) }) return Layer.CONTROLLER
+        // Other stereotypes (@Service/@Repository/@Component/@Configuration).
+        for (ann in t.annotationSimpleNames) Classify.LAYER_ANNOTATIONS[ann]?.let { return it }
         if (t.supertypeSimpleNames.any { it in Classify.REPOSITORY_BASE_TYPES }) return Layer.REPOSITORY
         if (t.supertypeSimpleNames.any { it in Classify.BATCH_COMPONENT_SUPERTYPES }) return Layer.BATCH
         return Layer.OTHER

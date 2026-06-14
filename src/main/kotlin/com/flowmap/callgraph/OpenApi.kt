@@ -93,9 +93,13 @@ object OpenApi {
                     (p.annotationSimpleNames.none { it in PARAM_ANNOTATIONS } && isComplex(p.type)))
         }
 
+        // A type contributes paths when it serves HTTP — an explicit @RestController/
+        // @Controller, OR (by behavior) any class with a server @*Mapping method (e.g. a
+        // @Service that exposes endpoints). Outbound @FeignClient/@HttpExchange clients excluded.
         private fun isController(t: IrType): Boolean =
             !t.isFeign && !t.isHttpExchange &&
-                t.annotationSimpleNames.any { it == "RestController" || it == "Controller" }
+                (t.annotationSimpleNames.any { it == "RestController" || it == "Controller" } ||
+                    t.functions.any { Classify.hasServerMapping(it.annotationSimpleNames) })
 
         private fun operation(t: IrType, fn: IrFunction, verb: String, path: String, tag: String): Map<String, Any?> {
             val op = LinkedHashMap<String, Any?>()

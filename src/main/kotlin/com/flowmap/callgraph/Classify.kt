@@ -95,6 +95,16 @@ object Classify {
         "RequestMapping" to "ANY",
     )
 
+    /**
+     * A method DECLARES a server HTTP endpoint when it carries a Spring server
+     * @*Mapping annotation (GetMapping/PostMapping/…/RequestMapping). Used to classify
+     * a class as a controller by BEHAVIOR — a class that serves endpoints is a
+     * controller even when stereotyped @Service/@Component. (Outbound @*Exchange
+     * client methods are deliberately excluded — those are calls, not endpoints.)
+     */
+    fun hasServerMapping(annotationSimpleNames: Set<String>): Boolean =
+        annotationSimpleNames.any { it in MAPPING_VERBS }
+
     val ASYNC_ANNOTATIONS: Set<String> = setOf("Async", "Scheduled")
 
     val ASYNC_BUILDERS: Set<String> = setOf(
