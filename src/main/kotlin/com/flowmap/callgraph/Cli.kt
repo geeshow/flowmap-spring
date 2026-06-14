@@ -50,6 +50,7 @@ fun main(rawArgs: Array<String>) {
         "openapi" -> cmdOpenApi(opts)
         "impact" -> cmdImpact(opts)
         "combine" -> cmdCombine(opts)
+        "sync" -> cmdSync(opts)
         "search" -> cmdSearch(opts)
         "stats" -> cmdStats(opts)
         "-h", "--help", "help" -> usage()
@@ -487,6 +488,29 @@ private fun cmdImpact(opts: Opts) {
     }
 }
 
+/**
+ * Standalone web-data assembly — the same step `refresh` runs last (step 7), but
+ * invokable on its own so a pipeline can run it AFTER the frontend analyzer has
+ * produced fresh artifacts (refresh's own combine must run BEFORE the frontend to
+ * provide `_combined.json`, but its sync must run AFTER). Copies per-project
+ * artifacts from `--out-dir` (+ any `--frontend-dir`) into `--sync-dir`, prunes
+ * departed/stale files, and (re)writes the app-facing `manifest.json`.
+ */
+private fun cmdSync(opts: Opts) {
+    val outDir = File(opts["--out-dir"] ?: "./json")
+    val syncPath = opts["--sync-dir"]?.takeIf { it.isNotBlank() }
+        ?: run { System.err.println("sync: --sync-dir <web data dir> required"); exitProcess(2) }
+    if (!outDir.isDirectory) { System.err.println("sync: --out-dir ${outDir.path} is not a directory"); exitProcess(2) }
+    val sources = ArrayList<File>().apply {
+        add(outDir)
+        opts["--frontend-dir"]?.split(",")?.map { it.trim() }?.filter { it.isNotEmpty() }
+            ?.forEach { add(File(it)) }
+    }
+    val dest = File(syncPath)
+    val r = Sync.run(sources, dest)
+    System.err.println("sync: ${r.copied} files copied, manifest.json with ${r.projects} projects -> ${dest.path}")
+}
+
 private fun cmdCombine(opts: Opts) {
     val paths = collectGraphPaths(opts)
     if (paths.isEmpty()) {
@@ -624,6 +648,8 @@ private fun usage() {
                   # change-impact per merged PR (git-first: `git log --first-parent`; falls back to `gh` only if git finds no PR markers)
                   # --pull-files <dir>: also write a <project>.pulls.json index + <project>.pulls/<number>.json shards (lazy-load, incremental)
           combine --graphs a.json,b.json,... | --dir <dir of *.json> [--gateway-routes routes.yml] [--gateway-name N] [--out f.json]
+          sync    --out-dir <analyzer out> --sync-dir <web data dir> [--frontend-dir d1,d2]
+                  # assemble the web data dir from existing artifacts (refresh's step 7, standalone) — run AFTER the frontend analyzer
           search  --method M [--graph g.json | --repo <dir>] [--direction both|callers|callees] [--depth N] [--out f]
           stats   [--graph g.json | --repo <dir>] [--project P] [--profile p]
         """.trimIndent()
