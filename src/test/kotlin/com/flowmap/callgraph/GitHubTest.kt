@@ -95,6 +95,45 @@ class GitHubTest {
         assertTrue("files" !in entry.keys)                    // index carries NO patch/files
     }
 
+    @Test fun `parseGitLog recovers PRs from merge + squash markers, skips non-PR commits`() {
+        val FS = "\u001f"; val RS = "\u001e"
+        val log = listOf(
+            "sha4${FS}2026-06-14T09:00:00Z${FS}Kyutae Park${FS}Merge pull request #4 from geeshow/feat-log${FS}feat(refresh): log PR analysis step\n\nbody detail",
+            "sha42${FS}2026-06-10T00:00:00Z${FS}me${FS}feat(x): do a thing (#42)$FS",
+            "shaX${FS}2026-06-09T00:00:00Z${FS}me${FS}chore: direct push, no PR$FS",
+        ).joinToString("$RS\n") + RS
+        val prs = GitHub.parseGitLog(log, 50)
+        assertEquals(2, prs.size)                                    // the non-PR commit is dropped
+        assertEquals(4, prs[0].number)
+        assertEquals("feat(refresh): log PR analysis step", prs[0].title)   // merge: title from body
+        assertEquals("sha4", prs[0].mergeCommit)
+        assertEquals("Kyutae Park", prs[0].author)
+        assertEquals(42, prs[1].number)
+        assertEquals("feat(x): do a thing", prs[1].title)            // squash: subject minus (#N)
+        assertEquals("sha42", prs[1].mergeCommit)
+        assertEquals(1, GitHub.parseGitLog(log, 1).size)             // limit respected
+    }
+
+    @Test fun `parseShow yields per-file status, patch and counts`() {
+        val diff = listOf(
+            "diff --git a/src/A.kt b/src/A.kt", "index 111..222 100644", "--- a/src/A.kt", "+++ b/src/A.kt",
+            "@@ -1,3 +1,4 @@", " ctx", "-old", "+new1", "+new2",
+            "diff --git a/new.txt b/new.txt", "new file mode 100644", "--- /dev/null", "+++ b/new.txt",
+            "@@ -0,0 +1,2 @@", "+a", "+b",
+            "diff --git a/old/x.kt b/new/x.kt", "similarity index 95%", "rename from old/x.kt", "rename to new/x.kt",
+            "diff --git a/gone.txt b/gone.txt", "deleted file mode 100644", "--- a/gone.txt", "+++ /dev/null",
+            "@@ -1,1 +0,0 @@", "-bye",
+            "diff --git a/img.png b/img.png", "index 000..555 100644", "Binary files a/img.png and b/img.png differ",
+        ).joinToString("\n")
+        val byPath = GitHub.parseShow(diff).associateBy { it.path }
+        assertEquals(5, byPath.size)
+        byPath["src/A.kt"]!!.let { assertEquals("modified", it.status); assertEquals(2, it.additions); assertEquals(1, it.deletions); assertEquals(3, it.changes); assertTrue(it.patch!!.startsWith("@@ -1,3 +1,4 @@")); assertEquals(null, it.previousPath) }
+        byPath["new.txt"]!!.let { assertEquals("added", it.status); assertEquals(2, it.additions); assertEquals(0, it.deletions) }
+        byPath["new/x.kt"]!!.let { assertEquals("renamed", it.status); assertEquals("old/x.kt", it.previousPath); assertEquals(null, it.patch) }
+        byPath["gone.txt"]!!.let { assertEquals("removed", it.status); assertEquals(0, it.additions); assertEquals(1, it.deletions) }
+        byPath["img.png"]!!.let { assertEquals("modified", it.status); assertEquals(null, it.patch); assertEquals(0, it.additions) }   // binary: no patch
+    }
+
     @Test fun `readShard round-trips so an already-collected PR can be reused`() {
         val pr = GitHub.Pr(7, "x", "me", "2024-01-01T00:00:00Z", "deadbee")
         val shard = GitHub.buildShard(pr, listOf(GitHub.PrFile("f.kt", "modified", 1, 1, 2, null, "p")), null)

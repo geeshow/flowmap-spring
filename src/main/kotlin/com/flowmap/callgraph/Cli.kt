@@ -204,9 +204,9 @@ private fun writePullFiles(outDir: File, project: String, repo: File, branch: St
         // reuse an already-collected PR (immutable) unless a refetch is forced
         var shard: Map<String, Any?>? =
             if (!refetch && shardFile.isFile) GitHub.readShard(shardFile)?.also { reused++ } else null
-        if (shard == null) {                                   // new PR (or forced/unreadable): fetch via gh
-            val files = GitHub.pullFiles(repo, pr.number)
-            if (files == null) {                               // gh failed: preserve any prior shard, don't prune it
+        if (shard == null) {                                   // new PR (or forced/unreadable): collect via git/gh
+            val files = GitHub.pullFiles(repo, pr)
+            if (files == null) {                               // both sources failed: preserve any prior shard, don't prune it
                 if (shardFile.isFile) {
                     keep.add(shardFile.name)
                     GitHub.readShard(shardFile)?.let { entries.add(GitHub.indexEntry(it, shardDirName)) }
@@ -354,8 +354,8 @@ private fun cmdRefresh(opts: Opts) {
                     val pulls = GitHub.mergedPulls(p, branch, impactMax)
                     val impactFile = File(outDir, "${p.name}.impact.json")
                     when {
-                        pulls == null -> {             // gh unavailable: keep any prior impact, don't overwrite/delete
-                            System.err.println("  ✗ ${p.name}: gh unavailable for base $branch (installed? authed? remote? base?) — keeping existing impact")
+                        pulls == null -> {             // no PR source: keep any prior impact, don't overwrite/delete
+                            System.err.println("  ✗ ${p.name}: no PR source for base $branch (no git PR markers + gh unavailable) — keeping existing impact")
                             failed++
                         }
                         pulls.isEmpty() -> {           // gh ran, no merged PRs: drop stale impact + pull-files so they aren't served
@@ -460,7 +460,7 @@ private fun cmdImpact(opts: Opts) {
     val depth = opts["--depth"]?.toIntOrNull() ?: 3
     val pulls = GitHub.mergedPulls(git, branch, max)
     if (pulls == null) {
-        System.err.println("impact: gh unavailable (installed? authed? on GitHub? base $branch?)"); exitProcess(1)
+        System.err.println("impact: no PR source for base $branch — git has no PR markers (merge/squash) and gh is unavailable"); exitProcess(1)
     }
     if (pulls.isEmpty()) {
         System.err.println("impact: no merged PRs for base $branch"); exitProcess(1)
@@ -621,7 +621,7 @@ private fun usage() {
           analyze --repo <dir> [--project P] [--out f.json] [--include-other] [--public-only] [--profile p] [--props kv.txt] [--restdocs dir]
           openapi --repo <dir> [--project P] [--out f.json] [--restdocs dir] [--title T] [--api-version V] [--profile p] [--props kv.txt]
           impact  --git <repo> (--graph g.json | --repo <dir> --project P) [--branch b] [--max N] [--depth N] [--out f.json] [--pull-files <dir>] [--refetch-pull-files]
-                  # change-impact per merged PR (via `gh`, base = --branch or current); needs gh auth + a GitHub remote
+                  # change-impact per merged PR (git-first: `git log --first-parent`; falls back to `gh` only if git finds no PR markers)
                   # --pull-files <dir>: also write a <project>.pulls.json index + <project>.pulls/<number>.json shards (lazy-load, incremental)
           combine --graphs a.json,b.json,... | --dir <dir of *.json> [--gateway-routes routes.yml] [--gateway-name N] [--out f.json]
           search  --method M [--graph g.json | --repo <dir>] [--direction both|callers|callees] [--depth N] [--out f]

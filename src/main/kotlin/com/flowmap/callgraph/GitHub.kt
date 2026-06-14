@@ -4,14 +4,15 @@ import com.fasterxml.jackson.databind.ObjectMapper
 import java.io.File
 
 /**
- * Merged pull-request log via the `gh` CLI. Used by [Impact] to analyze change
- * impact per PR (instead of per raw commit). Each PR is reduced to its merge
- * commit, whose first-parent diff is the PR's net change set — fed into the same
- * line→node machinery as before.
+ * Merged pull-request source for [Impact], which analyzes change impact per PR
+ * (not per raw commit). Each PR is reduced to its merge/squash commit, whose
+ * first-parent diff is the PR's net change set — fed into the line→node machinery.
  *
- * Degrades gracefully: if `gh` is missing, unauthenticated, offline, or the repo
- * is not on GitHub, [mergedPulls] returns an empty list and impact simply reports
- * no PRs for that project.
+ * GIT-FIRST, gh-fallback: PRs and their file diffs are derived from local git
+ * (`git log --first-parent` + `git show`) so analysis works with NO `gh` and on
+ * GitHub Enterprise. `gh` is used only when git yields no PR markers (e.g. a
+ * rebase-merge history) or can't run. Degrades gracefully: if neither source
+ * works, [mergedPulls] is null and impact reports no PRs for that project.
  */
 object GitHub {
     private val mapper = ObjectMapper()
@@ -43,11 +44,64 @@ object GitHub {
 
     /**
      * Newest-first merged PRs targeting [base] (all bases if null), capped at [limit].
-     * Returns null when `gh` could not run (missing / unauthenticated / offline / not
-     * a GitHub repo) — distinct from an empty list, which means gh ran fine and the
-     * base simply has no merged PRs. Callers use that to tell "unknown" from "none".
+     *
+     * GIT-FIRST: derive the PR set from the integration history `git log --first-parent`
+     * (no `gh`, works on any host incl. GitHub Enterprise) — each PR appears as either a
+     * merge commit (`Merge pull request #N`, title in the body) or a squash commit
+     * (subject `… (#N)`); the commit is the PR's merge commit, whose first-parent diff is
+     * its net change. Only when git yields NOTHING (e.g. rebase-merge history with no PR
+     * markers, or not a git repo) does it FALL BACK to `gh pr list`.
+     *
+     * Returns null only when BOTH sources are unavailable — distinct from an empty list,
+     * which means a source ran fine and the base simply has no merged PRs. Callers use
+     * that to tell "unknown" (keep prior artifacts) from "none" (prune stale).
      */
     fun mergedPulls(repo: File, base: String?, limit: Int): List<Pr>? {
+        val fromGit = gitMergedPulls(repo, base ?: "HEAD", limit)
+        if (fromGit.isNotEmpty()) return fromGit
+        return ghMergedPulls(repo, base, limit)
+    }
+
+    /** PR set parsed from `git log --first-parent` (merge + squash markers). Empty if none/not a git repo. */
+    fun gitMergedPulls(repo: File, base: String, limit: Int): List<Pr> {
+        // \x1f field sep, \x1e record sep — safe across multi-line bodies.
+        val (out, code) = git(repo, listOf(
+            "log", "--first-parent", base, "-n", "5000", "--no-color",
+            "--pretty=format:%H%x1f%cI%x1f%an%x1f%s%x1f%b%x1e",
+        ))
+        if (code != 0) return emptyList()
+        return parseGitLog(out, limit)
+    }
+
+    private val MERGE_PR = Regex("^Merge pull request #(\\d+) ")
+    private val SQUASH_PR = Regex("\\(#(\\d+)\\)\\s*$")
+
+    /** Parse the `%H\x1f%cI\x1f%an\x1f%s\x1f%b\x1e`-formatted log into newest-first PRs. Pure. */
+    fun parseGitLog(out: String, limit: Int): List<Pr> {
+        val prs = ArrayList<Pr>()
+        for (rec in out.split('\u001e')) {
+            val r = rec.trim('\n', '\r')
+            if (r.isBlank()) continue
+            val f = r.split('\u001f')
+            if (f.size < 4) continue
+            val sha = f[0].ifBlank { null } ?: continue
+            val date = f[1].ifBlank { null }
+            val author = f[2].ifBlank { null }
+            val subject = f[3]
+            val body = f.getOrElse(4) { "" }
+            val merge = MERGE_PR.find(subject)
+            val squash = if (merge == null) SQUASH_PR.find(subject) else null
+            val number = (merge ?: squash)?.groupValues?.get(1)?.toIntOrNull() ?: continue   // non-PR commit
+            val title = if (merge != null) body.lineSequence().firstOrNull { it.isNotBlank() }?.trim() ?: subject
+                        else subject.replace(SQUASH_PR, "").trim()
+            prs.add(Pr(number, title, author, date, sha))
+            if (prs.size >= limit) break
+        }
+        return prs
+    }
+
+    /** Merged PRs via `gh pr list` (server source / fallback). Null when `gh` cannot run. */
+    fun ghMergedPulls(repo: File, base: String?, limit: Int): List<Pr>? {
         val args = mutableListOf(
             "pr", "list", "--state", "merged", "--limit", limit.toString(),
             "--json", "number,title,author,mergedAt,mergeCommit",
@@ -75,13 +129,76 @@ object GitHub {
     }
 
     /**
-     * File-level change set of a single PR (status + unified patch) via the REST API:
-     * `gh api --paginate repos/{owner}/{repo}/pulls/{n}/files`. `{owner}/{repo}` are
-     * resolved by `gh` from the repo in [repo]; `--paginate` merges all pages into one
-     * JSON array (>30 files). Returns null when `gh` could not run (missing /
-     * unauthenticated / offline / not a GitHub repo), distinct from an empty list.
+     * File-level change set of a single PR (status + unified patch).
+     *
+     * GIT-FIRST: when the PR's [Pr.mergeCommit] is known, derive it locally from
+     * `git show --first-parent -M <sha>` (the PR's net diff) — no `gh`, works on
+     * GitHub Enterprise. Falls back to the REST API only when there is no merge
+     * commit or git can't run. Returns null only when neither source works.
      */
-    fun pullFiles(repo: File, number: Int): List<PrFile>? {
+    fun pullFiles(repo: File, pr: Pr): List<PrFile>? {
+        pr.mergeCommit?.let { sha ->
+            val fromGit = gitPullFiles(repo, sha)
+            if (fromGit != null) return fromGit
+        }
+        return ghPullFiles(repo, pr.number)
+    }
+
+    /** Per-file status + patch from a merge/squash commit's first-parent diff. Null if git can't run. */
+    fun gitPullFiles(repo: File, sha: String): List<PrFile>? {
+        val (out, code) = git(repo, listOf("show", "--first-parent", "-M", "--no-color", "--format=", sha))
+        if (code != 0) return null
+        return parseShow(out)
+    }
+
+    private val DIFF_GIT = Regex("^diff --git a/(.*) b/(.*)$")
+
+    /** Parse a `git show`/`git diff` unified diff into per-file [PrFile]s (status, patch, +/- counts). Pure. */
+    fun parseShow(diff: String): List<PrFile> {
+        val files = ArrayList<PrFile>()
+        var path: String? = null; var oldPath: String? = null
+        var status = "modified"; var add = 0; var del = 0
+        val patch = StringBuilder(); var inHunk = false
+        fun flush() {
+            val p = path ?: return
+            files.add(PrFile(
+                path = p, status = status, additions = add, deletions = del, changes = add + del,
+                previousPath = oldPath?.takeIf { status == "renamed" && it != p },
+                patch = patch.toString().ifEmpty { null },
+            ))
+        }
+        for (line in diff.lineSequence()) {
+            if (line.startsWith("diff --git ")) {           // new file block
+                flush()
+                path = null; oldPath = null; status = "modified"; add = 0; del = 0; patch.setLength(0); inHunk = false
+                DIFF_GIT.find(line)?.let { oldPath = it.groupValues[1]; path = it.groupValues[2] }
+                continue
+            }
+            if (inHunk) {                                    // hunk body until the next file block
+                patch.append(line).append('\n')
+                when (line.firstOrNull()) { '+' -> add++; '-' -> del++; else -> {} }
+                continue
+            }
+            when {                                           // pre-hunk file header
+                line.startsWith("new file") -> status = "added"
+                line.startsWith("deleted file") -> status = "removed"
+                line.startsWith("rename from ") -> { oldPath = line.removePrefix("rename from "); status = "renamed" }
+                line.startsWith("rename to ") -> path = line.removePrefix("rename to ")
+                line.startsWith("--- a/") -> oldPath = line.removePrefix("--- a/")
+                line.startsWith("+++ b/") -> path = line.removePrefix("+++ b/")
+                line.startsWith("@@") -> { inHunk = true; patch.append(line).append('\n') }
+            }
+        }
+        flush()
+        return files.filter { it.path.isNotEmpty() }
+    }
+
+    /**
+     * File-level change set via the REST API (fallback): `gh api --paginate
+     * repos/{owner}/{repo}/pulls/{n}/files`. `{owner}/{repo}` + host are resolved by
+     * `gh` from [repo]; `--paginate` merges all pages (>30 files). Null if `gh` can't run.
+     */
+    fun ghPullFiles(repo: File, number: Int): List<PrFile>? {
         val (out, code) = run(repo, listOf("api", "--paginate", "repos/{owner}/{repo}/pulls/$number/files"))
         if (code != 0) return null
         return parseFiles(out)
@@ -153,12 +270,16 @@ object GitHub {
         mapper.readValue(file, Map::class.java) as? Map<String, Any?>
     } catch (_: Exception) { null }
 
-    private fun run(repo: File, args: List<String>): Pair<String, Int> = try {
-        val p = ProcessBuilder(listOf("gh") + args).directory(repo).redirectErrorStream(false).start()
+    private fun run(repo: File, args: List<String>): Pair<String, Int> = exec(repo, "gh", args)
+    private fun git(repo: File, args: List<String>): Pair<String, Int> = exec(repo, "git", args)
+
+    /** Run [command] in [repo]; returns (stdout, exitCode), or ("", -1) if it can't be launched. */
+    private fun exec(repo: File, command: String, args: List<String>): Pair<String, Int> = try {
+        val p = ProcessBuilder(listOf(command) + args).directory(repo).redirectErrorStream(false).start()
         val out = p.inputStream.bufferedReader().readText()
         p.errorStream.readBytes()
         out to p.waitFor()
     } catch (_: Exception) {
-        "" to -1   // gh not installed / not executable
+        "" to -1   // command not installed / not executable
     }
 }
