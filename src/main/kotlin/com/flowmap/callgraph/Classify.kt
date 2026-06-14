@@ -32,6 +32,13 @@ object Classify {
         "NamedParameterJdbcTemplate", "KafkaTemplate", "WebTestClient",
     )
 
+    /**
+     * Methods that carry the request URL in a fluent HTTP-client chain
+     * (WebClient/RestClient: `client.get().uri(url)...`). Their immediate receiver is
+     * a builder/spec type, so the call is matched by walking the chain to its root client.
+     */
+    val FLUENT_URL_METHODS: Set<String> = setOf("uri")
+
     val EXTERNAL_PREFIXES: List<String> = listOf(
         "org.springframework.web.client.RestTemplate",
         "org.springframework.web.reactive.function.client.WebClient",

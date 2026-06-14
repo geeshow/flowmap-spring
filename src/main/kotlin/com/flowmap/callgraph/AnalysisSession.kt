@@ -293,6 +293,14 @@ class AnalysisSession : Resolver {
             if (recvType in Classify.EXTERNAL_SIMPLE_TYPES) {
                 return ext.resolveImperative(callExpr, recvType, method, enclosingClassDesc(callExpr), yml)
             }
+            // Fluent HTTP client chains (WebClient/RestClient): the URL-bearing `.uri(...)`
+            // call's direct receiver is a spec type, not the client. Walk to the chain's
+            // root receiver — if that is a WebClient/RestClient, treat this as a client call.
+            if (method in Classify.FLUENT_URL_METHODS) {
+                fluentClientRootType(callExpr)?.let { rootType ->
+                    return ext.resolveImperative(callExpr, rootType, method, enclosingClassDesc(callExpr), yml)
+                }
+            }
             val recvFqcn = simpleToFqcn[recvType]
             if (recvFqcn != null && method in Classify.REPOSITORY_INHERITED_METHODS) {
                 return CallResolution.RepositoryInherited(recvFqcn, method)
@@ -322,6 +330,35 @@ class AnalysisSession : Resolver {
                     else -> null
                 }
                 return typeText?.let { stripGenerics(it) }
+            }
+            return null
+        }
+
+        /**
+         * For a fluent HTTP-client chain like `webClient.get().uri(url).retrieve()`, the
+         * `.uri(...)` call's immediate receiver is a builder/spec type. Walk leftward
+         * through the dot-qualified chain to the root receiver and return its declared
+         * type when it is a WebClient/RestClient (else null).
+         */
+        private fun fluentClientRootType(callExpr: KtCallExpression): String? {
+            var node: KtExpression = (callExpr.parent as? KtDotQualifiedExpression) ?: return null
+            var root: KtExpression = node
+            while (node is KtDotQualifiedExpression) {
+                root = node.receiverExpression
+                node = root
+            }
+            bc.getType(root)?.constructor?.declarationDescriptor?.name?.asString()
+                ?.let { val t = stripGenerics(it); if (t in Classify.EXTERNAL_SIMPLE_TYPES) return t }
+            if (root is KtNameReferenceExpression) {
+                val tgt = bc.get(BindingContext.REFERENCE_TARGET, root)
+                val psi = tgt?.let { DescriptorToSourceUtils.descriptorToDeclaration(it) }
+                val typeText = when (psi) {
+                    is KtParameter -> psi.typeReference?.text
+                    is KtProperty -> psi.typeReference?.text
+                        ?: (psi.initializer as? KtCallExpression)?.calleeExpression?.text
+                    else -> null
+                }
+                typeText?.let { val t = stripGenerics(it); if (t in Classify.EXTERNAL_SIMPLE_TYPES) return t }
             }
             return null
         }

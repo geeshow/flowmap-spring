@@ -284,12 +284,21 @@ private fun cmdRefresh(opts: Opts) {
             val branch = GitLog.resolveBranch(p, opts["--branch"])
             if (branch == null) { System.err.println("  - ${p.name}: (no default branch, skip impact)"); continue }
             val pulls = GitHub.mergedPulls(p, branch, impactMax)
-            if (pulls.isEmpty()) { System.err.println("  - ${p.name}: (no merged PRs via gh for base $branch, skip impact)"); continue }
-            val result = Impact.analyze(p, branch, pulls, combined, impactDepth)
-            File(outDir, "${p.name}.impact.json").writeText(JsonOutput.writeValue(result))
-            impactCount++
-            val breaking = result["breakingDeletionCount"]
-            System.err.println("  + ${p.name}.impact.json (base $branch: ${pulls.size} PRs, ${result["changedNodeCount"]} changed nodes, $breaking breaking deletions)")
+            val impactFile = File(outDir, "${p.name}.impact.json")
+            when {
+                pulls == null ->                       // gh unavailable: keep any prior impact, don't overwrite/delete
+                    System.err.println("  - ${p.name}: (gh unavailable for base $branch, keeping existing impact)")
+                pulls.isEmpty() ->                     // gh ran, no merged PRs: drop stale impact so it isn't served
+                    System.err.println("  - ${p.name}: (no merged PRs for base $branch, skip impact)" +
+                        if (impactFile.delete()) " — removed stale ${p.name}.impact.json" else "")
+                else -> {
+                    val result = Impact.analyze(p, branch, pulls, combined, impactDepth)
+                    impactFile.writeText(JsonOutput.writeValue(result))
+                    impactCount++
+                    val breaking = result["breakingDeletionCount"]
+                    System.err.println("  + ${p.name}.impact.json (base $branch: ${pulls.size} PRs, ${result["changedNodeCount"]} changed nodes, $breaking breaking deletions)")
+                }
+            }
         }
     }
 
@@ -359,8 +368,11 @@ private fun cmdImpact(opts: Opts) {
     val max = opts["--max"]?.toIntOrNull() ?: 50
     val depth = opts["--depth"]?.toIntOrNull() ?: 3
     val pulls = GitHub.mergedPulls(git, branch, max)
+    if (pulls == null) {
+        System.err.println("impact: gh unavailable (installed? authed? on GitHub? base $branch?)"); exitProcess(1)
+    }
     if (pulls.isEmpty()) {
-        System.err.println("impact: no merged PRs via gh for base $branch (gh authed? on GitHub?)"); exitProcess(1)
+        System.err.println("impact: no merged PRs for base $branch"); exitProcess(1)
     }
     System.err.println("impact: ${git.name} base $branch, ${pulls.size} PRs, depth $depth")
     val result = Impact.analyze(git, branch, pulls, graph, depth)

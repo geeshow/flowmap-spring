@@ -2,9 +2,11 @@ package com.flowmap.callgraph
 
 import org.jetbrains.kotlin.descriptors.ClassDescriptor
 import org.jetbrains.kotlin.descriptors.PropertyDescriptor
+import org.jetbrains.kotlin.descriptors.VariableDescriptor
 import org.jetbrains.kotlin.descriptors.annotations.AnnotationDescriptor
 import org.jetbrains.kotlin.name.FqName
 import org.jetbrains.kotlin.name.Name
+import org.jetbrains.kotlin.psi.KtBinaryExpression
 import org.jetbrains.kotlin.psi.KtDotQualifiedExpression
 import org.jetbrains.kotlin.psi.KtExpression
 import org.jetbrains.kotlin.psi.KtNameReferenceExpression
@@ -43,8 +45,34 @@ class ConstantEvaluator(private val bc: BindingContext) {
         return when (expr) {
             is KtNameReferenceExpression -> resolveReference(expr, depth)
             is KtDotQualifiedExpression -> resolveDotQualified(expr, depth)
+            // `base + path` concatenation the compiler can't fold (e.g. a @Value base).
+            is KtBinaryExpression -> resolveConcat(expr, depth)
             else -> ResolvedString.NONE
         }
+    }
+
+    /**
+     * String `+` concatenation where the constant evaluator couldn't fold the whole
+     * expression (typically a runtime `@Value` base + a constant path). Combines the
+     * resolved operands; a resolved literal absolute path (`/...`) is returned on its
+     * own so the imperative resolver can compose it with the client's base URL.
+     */
+    private fun resolveConcat(expr: KtBinaryExpression, depth: Int): ResolvedString {
+        if (expr.operationToken != org.jetbrains.kotlin.lexer.KtTokens.PLUS) return ResolvedString.NONE
+        val left = resolveStringExpr(expr.left, depth + 1)
+        val right = resolveStringExpr(expr.right, depth + 1)
+        // Prefer a literal absolute path operand (host comes from the client's base URL).
+        right.literal?.takeIf { it.startsWith("/") }?.let { return ResolvedString(it, null) }
+        left.literal?.takeIf { it.startsWith("/") }?.let { return ResolvedString(it, null) }
+        // Both literal → straight concatenation.
+        if (left.literal != null && right.literal != null) {
+            return classify(left.literal + right.literal)
+        }
+        // base placeholder + literal path → keep placeholder host, append literal path.
+        val ph = left.placeholder ?: right.placeholder
+        val lit = left.literal ?: right.literal
+        if (ph != null && lit != null) return ResolvedString(null, ph + lit)
+        return if (!left.isEmpty) left else right
     }
 
     /** URI(X) / UriComponentsBuilder.fromUriString(X) / RequestEntity.get(...) → resolve X. */
@@ -70,11 +98,12 @@ class ConstantEvaluator(private val bc: BindingContext) {
             ?.getValue(TypeUtils.NO_EXPECTED_TYPE) as? String
 
     private fun resolveReference(expr: KtNameReferenceExpression, depth: Int): ResolvedString {
-        val target = bc.get(BindingContext.REFERENCE_TARGET, expr) as? PropertyDescriptor
+        val target = bc.get(BindingContext.REFERENCE_TARGET, expr) as? VariableDescriptor
             ?: return ResolvedString.NONE
-        // @Value("${...}") field → that placeholder
-        valuePlaceholderOf(target)?.let { return ResolvedString(null, it) }
-        // val with a (possibly non-const) literal initializer → follow PSI
+        // @Value("${...}") field → that placeholder (property fields only)
+        (target as? PropertyDescriptor)?.let { valuePlaceholderOf(it)?.let { ph -> return ResolvedString(null, ph) } }
+        // val with a (possibly non-const) literal initializer → follow PSI. Covers both
+        // class properties and local `val`s (`val path = SomePaths.X; val url = base + path`).
         val psi = DescriptorToSourceUtils.descriptorToDeclaration(target) as? KtProperty
         psi?.initializer?.let { return resolveStringExpr(it, depth + 1) }
         return ResolvedString.NONE

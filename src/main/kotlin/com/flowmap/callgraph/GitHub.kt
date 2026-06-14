@@ -24,15 +24,20 @@ object GitHub {
         val mergeCommit: String?,   // merge/squash commit oid; null if unavailable
     )
 
-    /** Newest-first merged PRs targeting [base] (all bases if null), capped at [limit]. */
-    fun mergedPulls(repo: File, base: String?, limit: Int): List<Pr> {
+    /**
+     * Newest-first merged PRs targeting [base] (all bases if null), capped at [limit].
+     * Returns null when `gh` could not run (missing / unauthenticated / offline / not
+     * a GitHub repo) — distinct from an empty list, which means gh ran fine and the
+     * base simply has no merged PRs. Callers use that to tell "unknown" from "none".
+     */
+    fun mergedPulls(repo: File, base: String?, limit: Int): List<Pr>? {
         val args = mutableListOf(
             "pr", "list", "--state", "merged", "--limit", limit.toString(),
             "--json", "number,title,author,mergedAt,mergeCommit",
         )
         if (base != null) { args.add("--base"); args.add(base) }
         val (out, code) = run(repo, args)
-        if (code != 0) return emptyList()
+        if (code != 0) return null
         return parse(out)
     }
 
