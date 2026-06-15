@@ -339,9 +339,8 @@ private fun cmdRefresh(opts: Opts) {
         System.err.println("[5/7] PR analysis: skipped (--no-impact)")
     } else {
         val impactMax = opts["--impact-max"]?.toIntOrNull() ?: 50
-        val impactDepth = opts["--impact-depth"]?.toIntOrNull() ?: 3
         val candidates = projects.count { it.name in liveBases }
-        System.err.println("[5/7] PR analysis (impact + pull-files): $candidates/${projects.size} project(s) with backend sources, max=$impactMax depth=$impactDepth")
+        System.err.println("[5/7] PR analysis (impact + pull-files): $candidates/${projects.size} project(s) with backend sources, max=$impactMax")
         var skipped = 0; var failed = 0
         for (p in projects) {
             if (p.name !in liveBases) continue        // non-backend dir (e.g. frontend) — already reported in step 2
@@ -366,8 +365,8 @@ private fun cmdRefresh(opts: Opts) {
                         }
                         else -> {
                             val ok = try {
-                                System.err.println("  → ${p.name}: ${pulls.size} PRs — analyzing impact (depth $impactDepth)…")
-                                val result = Impact.analyze(p, branch, pulls, combined, impactDepth)
+                                System.err.println("  → ${p.name}: ${pulls.size} PRs — analyzing impact…")
+                                val result = Impact.analyze(p, branch, pulls, combined)
                                 impactFile.writeText(JsonOutput.writeValue(result))
                                 impactCount++
                                 System.err.println("  ✓ ${p.name}.impact.json (${pulls.size} PRs, ${result["changedNodeCount"]} changed nodes, ${result["breakingDeletionCount"]} breaking deletions)")
@@ -458,7 +457,6 @@ private fun cmdImpact(opts: Opts) {
     // current graph: load --graph, else analyze --repo/--project
     val graph = opts["--graph"]?.let { JsonOutput.read(File(it).readText()) } ?: graphFromOpts(opts).first
     val max = opts["--max"]?.toIntOrNull() ?: 50
-    val depth = opts["--depth"]?.toIntOrNull() ?: 3
     val pulls = GitHub.mergedPulls(git, branch, max)
     if (pulls == null) {
         System.err.println("impact: no PR source for base $branch — git has no PR markers (merge/squash) and gh is unavailable"); exitProcess(1)
@@ -466,15 +464,14 @@ private fun cmdImpact(opts: Opts) {
     if (pulls.isEmpty()) {
         System.err.println("impact: no merged PRs for base $branch"); exitProcess(1)
     }
-    System.err.println("impact: ${git.name} base $branch, ${pulls.size} PRs, depth $depth")
-    val result = Impact.analyze(git, branch, pulls, graph, depth)
+    System.err.println("impact: ${git.name} base $branch, ${pulls.size} PRs")
+    val result = Impact.analyze(git, branch, pulls, graph)
     val text = JsonOutput.writeValue(result)
     val out = opts["--out"]
     if (out != null) {
         File(out).writeText(text)
-        @Suppress("UNCHECKED_CAST")
-        val eps = (result["endpointImpact"] as? List<*>)?.size ?: 0
-        System.err.println("wrote $out: ${pulls.size} PRs, ${result["changedNodeCount"]} changed nodes, $eps impacted endpoints")
+        System.err.println("wrote $out: ${pulls.size} PRs, ${result["changedNodeCount"]} changed nodes, " +
+            "${result["changedPublicMethodCount"]} changed public methods, ${result["breakingDeletionCount"]} breaking deletions")
     } else {
         println(text)
     }
@@ -633,7 +630,7 @@ private fun usage() {
                     + combine (auto-discovers gateways from spring.cloud.gateway.routes) + manifest
                     + optional sync (assemble the web app's data dir; ports sync-data.sh)
             refresh [--repo <dir>] [--out-dir ./json] [--no-pull] [--no-impact] [--no-pull-files] [--refetch-pull-files]
-                    [--impact-max N] [--impact-depth N] [--branch b]
+                    [--impact-max N] [--branch b]
                     # --no-pull-files: skip per-PR file diffs (status+patch) -> <project>.pulls.json + <project>.pulls/<n>.json
                     # incremental by default: PRs with an existing shard are reused (no gh call); --refetch-pull-files forces re-fetch
                     [--include-other] [--public-only] [--profile p] [--props kv.txt] [--title T]
@@ -644,7 +641,7 @@ private fun usage() {
           --- single-analysis tools (debugging / ad-hoc) ---
           analyze --repo <dir> [--project P] [--out f.json] [--include-other] [--public-only] [--profile p] [--props kv.txt] [--restdocs dir]
           openapi --repo <dir> [--project P] [--out f.json] [--restdocs dir] [--title T] [--api-version V] [--profile p] [--props kv.txt]
-          impact  --git <repo> (--graph g.json | --repo <dir> --project P) [--branch b] [--max N] [--depth N] [--out f.json] [--pull-files <dir>] [--refetch-pull-files]
+          impact  --git <repo> (--graph g.json | --repo <dir> --project P) [--branch b] [--max N] [--out f.json] [--pull-files <dir>] [--refetch-pull-files]
                   # change-impact per merged PR (git-first: `git log --first-parent`; falls back to `gh` only if git finds no PR markers)
                   # --pull-files <dir>: also write a <project>.pulls.json index + <project>.pulls/<number>.json shards (lazy-load, incremental)
           combine --graphs a.json,b.json,... | --dir <dir of *.json> [--gateway-routes routes.yml] [--gateway-name N] [--out f.json]
