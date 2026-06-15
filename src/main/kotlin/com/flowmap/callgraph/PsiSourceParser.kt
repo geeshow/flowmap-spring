@@ -4,9 +4,19 @@ import org.jetbrains.kotlin.cli.common.CLIConfigurationKeys
 import org.jetbrains.kotlin.cli.common.messages.MessageCollector
 import org.jetbrains.kotlin.cli.jvm.compiler.EnvironmentConfigFiles
 import org.jetbrains.kotlin.cli.jvm.compiler.KotlinCoreEnvironment
+import org.jetbrains.kotlin.com.intellij.lang.java.JavaLanguage
 import org.jetbrains.kotlin.com.intellij.openapi.util.Disposer
+import org.jetbrains.kotlin.com.intellij.psi.PsiAnnotation
+import org.jetbrains.kotlin.com.intellij.psi.PsiClass
+import org.jetbrains.kotlin.com.intellij.psi.PsiFileFactory
+import org.jetbrains.kotlin.com.intellij.psi.PsiJavaFile
+import org.jetbrains.kotlin.com.intellij.psi.PsiLiteralExpression
+import org.jetbrains.kotlin.com.intellij.psi.PsiMethod
+import org.jetbrains.kotlin.com.intellij.psi.PsiModifier
+import org.jetbrains.kotlin.com.intellij.psi.util.PsiTreeUtil
 import org.jetbrains.kotlin.config.CommonConfigurationKeys
 import org.jetbrains.kotlin.config.CompilerConfiguration
+import org.jetbrains.kotlin.lexer.KtTokens
 import org.jetbrains.kotlin.psi.KtAnnotationEntry
 import org.jetbrains.kotlin.psi.KtClassOrObject
 import org.jetbrains.kotlin.psi.KtCollectionLiteralExpression
@@ -18,12 +28,15 @@ import org.jetbrains.kotlin.psi.KtStringTemplateExpression
 import org.jetbrains.kotlin.psi.psiUtil.collectDescendantsOfType
 
 /**
- * Lightweight PSI parser (no BindingContext) that maps Kotlin source *text* to its
- * declared methods and their 1-based line ranges, keyed by the SAME node id the call
- * graph uses (`<fqcn>#<method>`, synthetic `.Companion` stripped — mirrors
+ * Lightweight PSI parser (no BindingContext) that maps Kotlin OR Java source *text*
+ * to its declared methods and their 1-based line ranges, keyed by the SAME node id the
+ * call graph uses (`<fqcn>#<method>`, synthetic `.Companion` stripped — mirrors
  * GraphBuilder.normalizeFqcn). [Impact] feeds it the content of a changed file *at a
  * given revision*, so a commit's changed line ranges map onto graph node ids without
  * re-running full semantic analysis. Cheap enough to call per changed file per commit.
+ *
+ * Java is handled with the bundled IntelliJ Java PSI so a Java PR's changed methods
+ * map to the same `<fqcn>#<method>` ids [JavaSourceAnalyzer] emits for the graph.
  */
 class PsiSourceParser : AutoCloseable {
     private val disposable = Disposer.newDisposable("psi-source-parser")
@@ -36,18 +49,27 @@ class PsiSourceParser : AutoCloseable {
         EnvironmentConfigFiles.JVM_CONFIG_FILES,
     )
     private val factory = KtPsiFactory(env.project)
+    private val javaFactory = PsiFileFactory.getInstance(env.project)
 
     /**
-     * A declared function with its 1-based inclusive line range and (for
-     * @RestController/@Controller methods) its HTTP endpoint, all from PSI literals.
+     * A declared function with its 1-based inclusive line range, its visibility, and
+     * (for @*Mapping methods) its HTTP endpoint — all from PSI literals.
      */
     data class FnRange(
         val nodeId: String, val startLine: Int, val endLine: Int,
+        val visibility: String = "public",
         val isEndpoint: Boolean = false, val httpMethod: String? = null, val endpoint: String? = null,
-    )
+    ) {
+        val isPublic: Boolean get() = visibility == "public"
+    }
 
-    /** Declared functions (inside classes/objects) with line ranges + endpoint metadata. */
-    fun functions(fileName: String, text: String): List<FnRange> {
+    /** Declared functions (inside classes/objects) with line ranges + visibility + endpoint metadata. */
+    fun functions(fileName: String, text: String): List<FnRange> =
+        if (fileName.endsWith(".java")) functionsJava(fileName, text) else functionsKotlin(fileName, text)
+
+    // ---- Kotlin ----
+
+    private fun functionsKotlin(fileName: String, text: String): List<FnRange> {
         val name = if (fileName.endsWith(".kt")) fileName.substringAfterLast('/') else "Snippet.kt"
         val kt = try { factory.createFile(name, text) } catch (_: Throwable) { return emptyList() }
         val lineIndex = LineIndex(text)
@@ -75,11 +97,19 @@ class PsiSourceParser : AutoCloseable {
                 }
                 out.add(FnRange(
                     "$fqcn#$fnName", lineIndex.lineAt(r.startOffset), lineIndex.lineAt(r.endOffset),
+                    visibility = ktVisibility(fn),
                     isEndpoint = ep != null, httpMethod = verb, endpoint = ep,
                 ))
             }
         }
         return out
+    }
+
+    private fun ktVisibility(fn: KtNamedFunction): String = when {
+        fn.hasModifier(KtTokens.PRIVATE_KEYWORD) -> "private"
+        fn.hasModifier(KtTokens.PROTECTED_KEYWORD) -> "protected"
+        fn.hasModifier(KtTokens.INTERNAL_KEYWORD) -> "internal"
+        else -> "public"
     }
 
     /** First string-literal value of an annotation arg (positional or one of [names]); null if `${}`/absent. */
@@ -99,6 +129,63 @@ class PsiSourceParser : AutoCloseable {
         if (st.entries.any { it !is KtLiteralStringTemplateEntry }) return null
         return st.entries.joinToString("") { it.text }
     }
+
+    // ---- Java ----
+
+    private fun functionsJava(fileName: String, text: String): List<FnRange> {
+        val name = fileName.substringAfterLast('/')
+        val psi = try { javaFactory.createFileFromText(name, JavaLanguage.INSTANCE, text) as? PsiJavaFile }
+        catch (_: Throwable) { null } ?: return emptyList()
+        val lineIndex = LineIndex(text)
+        val out = ArrayList<FnRange>()
+        PsiTreeUtil.findChildrenOfType(psi, PsiClass::class.java).forEach { cls ->
+            val fqcn = cls.qualifiedName ?: return@forEach
+            val annNames = cls.modifierList?.annotations?.mapNotNull { javaShortName(it) }?.toSet().orEmpty()
+            val isExternalClient = "FeignClient" in annNames || "HttpExchange" in annNames
+            val basePath = cls.modifierList?.annotations
+                ?.firstOrNull { javaShortName(it) == "RequestMapping" || javaShortName(it) == "HttpExchange" }
+                ?.let { javaAnnArg(it, "value", "path", "url") }
+            cls.methods.filterNot { it.isConstructor }.forEach { m ->
+                val r = m.textRange ?: return@forEach
+                var verb: String? = null
+                var ep: String? = null
+                if (!isExternalClient) {
+                    for (ann in m.modifierList.annotations) {
+                        val v = Classify.MAPPING_VERBS[javaShortName(ann)] ?: continue
+                        verb = v; ep = compose(basePath, javaAnnArg(ann, "value", "path")); break
+                    }
+                }
+                out.add(FnRange(
+                    "$fqcn#${m.name}", lineIndex.lineAt(r.startOffset), lineIndex.lineAt(r.endOffset),
+                    visibility = javaVisibility(m),
+                    isEndpoint = ep != null, httpMethod = verb, endpoint = ep,
+                ))
+            }
+        }
+        return out
+    }
+
+    private fun javaShortName(ann: PsiAnnotation): String? =
+        ann.nameReferenceElement?.referenceName?.substringAfterLast('.')
+
+    private fun javaVisibility(m: PsiMethod): String = when {
+        m.hasModifierProperty(PsiModifier.PRIVATE) -> "private"
+        m.hasModifierProperty(PsiModifier.PROTECTED) -> "protected"
+        else -> "public"   // package-private treated as public, matching the analyzer's IR
+    }
+
+    /** First string literal of a Java annotation arg ([names] or positional `value`); null if non-literal/absent. */
+    private fun javaAnnArg(ann: PsiAnnotation, vararg names: String): String? {
+        val wanted = names.toSet()
+        for (attr in ann.parameterList.attributes) {
+            val n = attr.name ?: "value"
+            if (n !in wanted) continue
+            (attr.value as? PsiLiteralExpression)?.value?.let { if (it is String) return it }
+        }
+        return null
+    }
+
+    // ---- shared ----
 
     /** base + method path → normalized "/a/b" (mirror of GraphBuilder.compose). */
     private fun compose(base: String?, path: String?): String {

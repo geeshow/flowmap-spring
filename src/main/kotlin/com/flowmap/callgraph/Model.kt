@@ -20,6 +20,26 @@ enum class CallMode(val json: String) {
     SYNC("sync"), ASYNC("async")
 }
 
+/**
+ * The kind of runtime entry point a method exposes — i.e. how the framework (not
+ * other project code) invokes it. These are the natural ROOTS for a reachability
+ * traversal. `null` on a node means it is not an entry point (it is only reached
+ * via internal calls). Derived from annotations / supertypes in [GraphBuilder].
+ */
+enum class EntryPointKind {
+    HTTP,        // @*Mapping server endpoint (also a @Service/@Component that serves HTTP)
+    KAFKA,       // @KafkaListener / @KafkaHandler / @RetryableTopic
+    RABBIT,      // @RabbitListener / @RabbitHandler
+    JMS,         // @JmsListener
+    SQS,         // @SqsListener
+    SCHEDULED,   // @Scheduled
+    EVENT,       // @EventListener / @TransactionalEventListener
+    RUNNER,      // CommandLineRunner / ApplicationRunner #run
+    WEBSOCKET,   // @MessageMapping / @SubscribeMapping
+    GRPC,        // @GrpcService handler method
+    BATCH,       // Spring Batch Job/Step bean (launched by a scheduler/launcher)
+}
+
 data class MethodNode(
     val id: String,                  // "<fqcn>#<method>"; external: "ext:<service>#<method>"
     val fqcn: String,
@@ -40,6 +60,7 @@ data class MethodNode(
     val clientPackage: String?,      // ADDITIVE: package of the external client class/interface
     val resourceType: String? = null, // RESOURCE node kind: "kafka-topic" | "redis" | "db-table"
     val description: String? = null,  // controller endpoint: REST Docs / API description
+    val entryPoint: EntryPointKind? = null, // ADDITIVE: runtime entry-point kind (reachability root); null = not an entry point
 ) {
     fun toJson(): LinkedHashMap<String, Any?> = linkedMapOf(
         "id" to id,
@@ -55,6 +76,7 @@ data class MethodNode(
         "externalUrl" to externalUrl,
         "resourceType" to resourceType,
         "description" to description,
+        "entryPoint" to entryPoint?.name,
         "urlPlaceholder" to urlPlaceholder,
         "clientPackage" to clientPackage,
         "file" to file,

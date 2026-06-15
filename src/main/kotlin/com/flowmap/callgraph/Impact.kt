@@ -43,6 +43,7 @@ object Impact {
         val parser = PsiSourceParser()
         val perPull = ArrayList<Map<String, Any?>>()
         val allChangedInGraph = LinkedHashSet<String>()
+        val allChangedPublic = LinkedHashSet<String>()
         val endpointToPulls = LinkedHashMap<String, LinkedHashSet<Int>>()
         val deletedAgg = LinkedHashMap<String, DeletedEndpoint>()   // node id -> aggregate
 
@@ -51,18 +52,22 @@ object Impact {
                 val sha = pr.mergeCommit ?: continue
                 val parent = GitLog.firstParent(repo, sha)
                 val changes = GitLog.changesIn(repo, sha)
-                val changedIds = LinkedHashSet<String>()
+                // id -> the changed method's parsed range (carries visibility); first-seen wins.
+                val changedFns = LinkedHashMap<String, PsiSourceParser.FnRange>()
                 val deletedIds = LinkedHashSet<String>()
                 val deletedEps = ArrayList<Map<String, Any?>>()
 
                 for (ch in changes) {
-                    if (!ch.path.endsWith(".kt")) continue
+                    // Kotlin AND Java sources are mapped to method node ids; other files are skipped.
+                    if (!ch.path.endsWith(".kt") && !ch.path.endsWith(".java")) continue
                     val newFns = if (ch.changeType == "DELETE") emptyList()
                     else GitLog.fileAt(repo, sha, ch.path)?.let { parser.functions(ch.path, it) } ?: emptyList()
 
                     // changed methods: hunks ∩ new-revision method ranges
                     if (ch.changeType != "DELETE" && ch.newRanges.isNotEmpty()) {
-                        for (fn in newFns) if (ch.newRanges.any { it.first <= fn.endLine && fn.startLine <= it.last }) changedIds.add(fn.nodeId)
+                        for (fn in newFns) if (ch.newRanges.any { it.first <= fn.endLine && fn.startLine <= it.last }) {
+                            changedFns.putIfAbsent(fn.nodeId, fn)
+                        }
                     }
 
                     // deleted methods: present in the PR's base, gone after the merge
@@ -81,18 +86,33 @@ object Impact {
                     }
                 }
 
-                val inGraph = changedIds.filter { it in nodeById }
+                val inGraph = changedFns.keys.filter { it in nodeById }
                 allChangedInGraph.addAll(inGraph)
                 val sub = Bfs.bfs(graph, inGraph, Bfs.Direction.CALLERS, depth)
                 val endpoints = sub.nodes.filter { it.endpoint != null || it.httpMethod != null }
                 val services = sub.nodes.mapNotNull { it.project ?: it.externalService }.distinct().sorted()
                 for (ep in endpoints) endpointToPulls.getOrPut(ep.id) { LinkedHashSet() }.add(pr.number)
 
+                // A changed method's visibility: prefer the analyzed graph node (authoritative),
+                // else the parser's reading of the changed revision. "public" methods are the
+                // module's API surface — the ones whose change can affect other code.
+                fun visOf(fn: PsiSourceParser.FnRange) = nodeById[fn.nodeId]?.visibility ?: fn.visibility
+                val changedNodes = changedFns.values.map { fn ->
+                    val vis = visOf(fn)
+                    linkedMapOf<String, Any?>(
+                        "id" to fn.nodeId, "inGraph" to (fn.nodeId in nodeById),
+                        "visibility" to vis, "public" to (vis == "public"),
+                    )
+                }
+                val changedPublic = changedFns.values.filter { visOf(it) == "public" }.map { it.nodeId }
+                allChangedPublic.addAll(changedPublic)
+
                 perPull.add(linkedMapOf(
                     "number" to pr.number, "title" to pr.title, "author" to pr.author,
                     "mergedAt" to pr.mergedAt, "mergeCommit" to sha,
                     "changedFiles" to changes.map { it.path },
-                    "changedNodes" to changedIds.map { linkedMapOf("id" to it, "inGraph" to (it in nodeById)) },
+                    "changedNodes" to changedNodes,
+                    "changedPublicMethods" to changedPublic,
                     "deletedNodes" to deletedIds.toList(),
                     "deletedEndpoints" to deletedEps,
                     "impactedEndpoints" to endpoints.map { endpointRef(it) },
@@ -130,6 +150,7 @@ object Impact {
         return linkedMapOf(
             "base" to base, "repoUrl" to webBase, "pullCount" to pulls.size, "depth" to depth,
             "changedNodeCount" to allChangedInGraph.size,
+            "changedPublicMethodCount" to allChangedPublic.size,
             "deletedEndpointCount" to deletedEndpoints.size,
             "trulyDeletedEndpointCount" to deletedEndpoints.count { it["pathStillServed"] == false },
             "breakingDeletionCount" to deletedEndpoints.count { it["breaking"] == true },

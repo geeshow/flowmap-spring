@@ -107,6 +107,32 @@ object Classify {
 
     val ASYNC_ANNOTATIONS: Set<String> = setOf("Async", "Scheduled")
 
+    // ---- entry points (reachability roots): how the framework — not project code — invokes a method ----
+
+    /** `@Scheduled` / `@Schedules` -> periodic entry point. */
+    val SCHEDULED_ANNOTATIONS: Set<String> = setOf("Scheduled", "Schedules")
+
+    /** Spring application-event listeners. (Publishers' `publishEvent` calls are NOT static edges.) */
+    val EVENT_LISTENER_ANNOTATIONS: Set<String> = setOf("EventListener", "TransactionalEventListener")
+
+    /** RabbitMQ / AMQP consumers. */
+    val RABBIT_LISTENER_ANNOTATIONS: Set<String> = setOf("RabbitListener", "RabbitHandler")
+
+    /** JMS consumers. */
+    val JMS_LISTENER_ANNOTATIONS: Set<String> = setOf("JmsListener")
+
+    /** AWS SQS consumers (spring-cloud-aws). */
+    val SQS_LISTENER_ANNOTATIONS: Set<String> = setOf("SqsListener", "SqsListeners")
+
+    /** STOMP / WebSocket message handlers. */
+    val WEBSOCKET_MAPPING_ANNOTATIONS: Set<String> = setOf("MessageMapping", "SubscribeMapping")
+
+    /** gRPC service stereotype (net.devh / spring-grpc) — its public handlers are entry points. */
+    val GRPC_SERVICE_ANNOTATIONS: Set<String> = setOf("GrpcService")
+
+    /** Spring Boot lifecycle runners — the `run` method is a boot-time entry point. */
+    val RUNNER_SUPERTYPES: Set<String> = setOf("CommandLineRunner", "ApplicationRunner")
+
     val ASYNC_BUILDERS: Set<String> = setOf(
         "launch", "async", "withContext", "runBlocking", "supervisorScope",
         "coroutineScope", "flow", "produce",

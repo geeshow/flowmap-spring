@@ -49,6 +49,7 @@ object JsonOutput {
                 clientPackage = n.str("clientPackage"),
                 resourceType = n.str("resourceType"),
                 description = n.str("description"),
+                entryPoint = n.str("entryPoint")?.let { runCatching { EntryPointKind.valueOf(it) }.getOrNull() },
             )
         }
         val edges = root["edges"].map { e ->

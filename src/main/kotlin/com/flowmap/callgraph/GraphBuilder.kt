@@ -106,11 +106,12 @@ class GraphBuilder(
 
     private fun makeNode(t: IrType, fn: IrFunction, f: IrFile, typeLayer: Layer): MethodNode {
         val (verb, endpoint) = endpointOf(t, fn)
+        val nl = nodeLayer(typeLayer, fn)
         return MethodNode(
             id = nid(t.fqcn, fn.name),
             fqcn = normalizeFqcn(t.fqcn),
             method = fn.name,
-            layer = nodeLayer(typeLayer, fn),
+            layer = nl,
             visibility = fn.visibility,
             isAsync = isAsyncFn(fn),
             returnType = fn.returnTypeSimple,
@@ -125,7 +126,32 @@ class GraphBuilder(
             urlPlaceholder = null,
             clientPackage = null,
             description = descriptionFor(verb, endpoint) ?: fn.apiDescription,
+            entryPoint = entryPointOf(t, fn, nl),
         )
+    }
+
+    /**
+     * The runtime entry-point kind a method exposes (a reachability ROOT), or null
+     * when it is reached only via internal calls. Order matters: the most specific
+     * inbound trigger wins. HTTP is detected by BEHAVIOR (a @*Mapping method), so a
+     * @Service/@Component serving endpoints is an HTTP entry too — matching [layerOf].
+     */
+    private fun entryPointOf(t: IrType, fn: IrFunction, nodeLayer: Layer): EntryPointKind? {
+        fun anyAnn(set: Set<String>) = fn.annotationSimpleNames.any { it in set }
+        return when {
+            fn.httpMethod != null && Classify.hasServerMapping(fn.annotationSimpleNames) -> EntryPointKind.HTTP
+            fn.kafkaConsumed.isNotEmpty() || anyAnn(Classify.KAFKA_LISTENER_ANNOTATIONS) -> EntryPointKind.KAFKA
+            anyAnn(Classify.RABBIT_LISTENER_ANNOTATIONS) -> EntryPointKind.RABBIT
+            anyAnn(Classify.JMS_LISTENER_ANNOTATIONS) -> EntryPointKind.JMS
+            anyAnn(Classify.SQS_LISTENER_ANNOTATIONS) -> EntryPointKind.SQS
+            anyAnn(Classify.SCHEDULED_ANNOTATIONS) -> EntryPointKind.SCHEDULED
+            anyAnn(Classify.EVENT_LISTENER_ANNOTATIONS) -> EntryPointKind.EVENT
+            anyAnn(Classify.WEBSOCKET_MAPPING_ANNOTATIONS) -> EntryPointKind.WEBSOCKET
+            fn.name == "run" && t.supertypeSimpleNames.any { it in Classify.RUNNER_SUPERTYPES } -> EntryPointKind.RUNNER
+            fn.visibility == "public" && t.annotationSimpleNames.any { it in Classify.GRPC_SERVICE_ANNOTATIONS } -> EntryPointKind.GRPC
+            nodeLayer == Layer.BATCH && isBatchBean(fn) -> EntryPointKind.BATCH
+            else -> null
+        }
     }
 
     /**

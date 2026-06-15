@@ -90,8 +90,40 @@ object Manifest {
             "screens" to sibling("screens.json"),
             "nodes" to nodes,
             "edges" to edges,
+            "entryPoints" to entryPointTotals(nodesArr),
+            "modules" to moduleSummaries(nodesArr),
             "generated" to iso(Instant.ofEpochMilli(graphFile.lastModified())),
         )
+    }
+
+    /** Project-wide entry-point counts by kind, e.g. `{"HTTP":12,"KAFKA":2}` (empty when none). */
+    private fun entryPointTotals(nodesArr: com.fasterxml.jackson.databind.JsonNode?): LinkedHashMap<String, Int> {
+        val out = LinkedHashMap<String, Int>()
+        nodesArr?.forEach { n ->
+            n["entryPoint"]?.takeIf { !it.isNull }?.asText()?.let { out[it] = (out[it] ?: 0) + 1 }
+        }
+        return out
+    }
+
+    /**
+     * Per-module breakdown so a multi-module project is catalogued module-by-module:
+     * each entry carries its node count and its entry-point counts by kind. A module
+     * with no entry points (e.g. a pure domain/library module) still appears, with an
+     * empty `entryPoints` map — making "which module owns the endpoints" explicit.
+     */
+    private fun moduleSummaries(nodesArr: com.fasterxml.jackson.databind.JsonNode?): List<LinkedHashMap<String, Any?>> {
+        if (nodesArr == null) return emptyList()
+        data class Acc(var nodes: Int = 0, val eps: LinkedHashMap<String, Int> = LinkedHashMap())
+        val byModule = LinkedHashMap<String, Acc>()
+        nodesArr.forEach { n ->
+            val module = n["module"]?.takeIf { !it.isNull }?.asText() ?: return@forEach
+            val acc = byModule.getOrPut(module) { Acc() }
+            acc.nodes++
+            n["entryPoint"]?.takeIf { !it.isNull }?.asText()?.let { acc.eps[it] = (acc.eps[it] ?: 0) + 1 }
+        }
+        return byModule.entries.sortedBy { it.key }.map { (name, acc) ->
+            linkedMapOf<String, Any?>("name" to name, "nodes" to acc.nodes, "entryPoints" to acc.eps)
+        }
     }
 
     /**
