@@ -361,7 +361,7 @@ private fun cmdRefresh(opts: Opts) {
     if (opts.has("--no-impact")) {
         System.err.println("[5/7] PR analysis: skipped (--no-impact)")
     } else {
-        val impactMax = opts["--impact-max"]?.toIntOrNull() ?: 50
+        val impactMax = opts["--impact-max"]?.toIntOrNull() ?: 10
         val candidates = projects.count { it.name in liveBases }
         System.err.println("[5/7] PR analysis (impact + pull-files): $candidates/${projects.size} project(s) with backend sources, max=$impactMax")
         var skipped = 0; var failed = 0
@@ -480,7 +480,7 @@ private fun cmdImpact(opts: Opts) {
     }
     // current graph: load --graph, else analyze --repo/--project
     val graph = opts["--graph"]?.let { JsonOutput.read(File(it).readText()) } ?: graphFromOpts(opts).first
-    val max = opts["--max"]?.toIntOrNull() ?: 50
+    val max = opts["--max"]?.toIntOrNull() ?: 10
     val pulls = GitHub.mergedPulls(git, branch, max)
     if (pulls == null) {
         System.err.println("impact: no PR source for base $branch — git has no PR markers (merge/squash) and gh is unavailable"); exitProcess(1)
@@ -657,7 +657,7 @@ private fun usage() {
                     + combine (auto-discovers gateways from spring.cloud.gateway.routes) + manifest
                     + optional sync (assemble the web app's data dir; ports sync-data.sh)
             refresh [--repo <dir>] [--out-dir ./json] [--no-pull] [--no-impact] [--no-pull-files] [--refetch-pull-files]
-                    [--impact-max N] [--branch b]
+                    [--impact-max N (default 10)] [--branch b]
                     # --no-pull-files: skip per-PR file diffs (status+patch) -> <project>.pulls.json + <project>.pulls/<n>.json
                     # incremental by default: PRs with an existing shard are reused (no gh call); --refetch-pull-files forces re-fetch
                     [--include-other] [--public-only] [--profile p] [--props kv.txt] [--title T]
@@ -668,7 +668,7 @@ private fun usage() {
           --- single-analysis tools (debugging / ad-hoc) ---
           analyze --repo <dir> [--project P] [--out f.json] [--include-other] [--public-only] [--profile p] [--props kv.txt] [--restdocs dir]
           openapi --repo <dir> [--project P] [--out f.json] [--restdocs dir] [--title T] [--api-version V] [--profile p] [--props kv.txt]
-          impact  --git <repo> (--graph g.json | --repo <dir> --project P) [--branch b] [--max N] [--out f.json] [--pull-files <dir>] [--refetch-pull-files]
+          impact  --git <repo> (--graph g.json | --repo <dir> --project P) [--branch b] [--max N (default 10)] [--out f.json] [--pull-files <dir>] [--refetch-pull-files]
                   # change-impact per merged PR (git-first: `git log --first-parent`; falls back to `gh` only if git finds no PR markers)
                   # --pull-files <dir>: also write a <project>.pulls.json index + <project>.pulls/<number>.json shards (lazy-load, incremental)
           combine --graphs a.json,b.json,... | --dir <dir of *.json> [--gateway-routes routes.yml] [--gateway-name N] [--out f.json]
