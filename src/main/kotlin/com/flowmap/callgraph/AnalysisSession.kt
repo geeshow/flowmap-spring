@@ -111,6 +111,18 @@ class AnalysisSession : Resolver {
                 }
             }
 
+            // Java sources: parse with the bundled IntelliJ Java PSI and contribute their
+            // fqcns to the SAME maps BEFORE building, so Kotlin->Java (resolved via the
+            // binding context) and Java->Java (resolved heuristically) calls become
+            // internal edges. .kt files are analyzed by the Kotlin front-end above; Java
+            // bodies are not (the front-end only reads Java signatures), so we walk them here.
+            val javaAnalyzer = JavaSourceAnalyzer(environment.project, root)
+            val parsedJava = javaAnalyzer.parse(discoverJavaFiles(sourceRoots))
+            for ((fq, simple) in javaAnalyzer.declaredTypes(parsedJava)) {
+                projectFqcns.add(fq)
+                simpleToFqcn.putIfAbsent(simple, fq)
+            }
+
             val constEval = ConstantEvaluator(bc)
             val ext = ExternalResolver(constEval)
             val ymlCache = HashMap<String, YamlPropertyResolver>()
@@ -120,11 +132,20 @@ class AnalysisSession : Resolver {
                     else YamlPropertyResolver.fromProps(extraProps)
                 }
             }
-            return ktFiles.mapNotNull { builder.buildFile(it) }
+            val kotlinIr = ktFiles.mapNotNull { builder.buildFile(it) }
+            val javaIr = javaAnalyzer.build(parsedJava, projectFqcns, simpleToFqcn)
+            return kotlinIr + javaIr
         } finally {
             Disposer.dispose(disposable)
         }
     }
+
+    /** All `.java` files under the discovered source roots (Kotlin's getSourceFiles() returns only .kt). */
+    private fun discoverJavaFiles(sourceRoots: List<File>): List<File> =
+        sourceRoots.asSequence().flatMap { sr ->
+            sr.walkTopDown().onEnter { it.name !in skipDirs }
+                .filter { it.isFile && it.extension == "java" }
+        }.distinctBy { it.absolutePath }.toList()
 
     // ---- IR construction over a fixed BindingContext ----
 
