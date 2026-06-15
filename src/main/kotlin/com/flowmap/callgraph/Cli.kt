@@ -233,6 +233,28 @@ private fun removePullFiles(outDir: File, project: String): Boolean {
     return idx || dir
 }
 
+/**
+ * Write the per-PR impact SHARDS into `<outDir>/<project>.impact/<number>.json` (the
+ * heavy detail lazy-loaded by the UI), pruning shards for PRs no longer in this run.
+ * The lean `<project>.impact.json` index is written separately by the caller.
+ */
+private fun writeImpactShards(outDir: File, project: String, shards: Map<Int, Map<String, Any?>>) {
+    val dir = File(outDir, "$project.impact").also { it.mkdirs() }
+    val keep = HashSet<String>()
+    for ((number, shard) in shards) {
+        File(dir, "$number.json").writeText(JsonOutput.writeValue(shard)); keep.add("$number.json")
+    }
+    dir.listFiles { f -> f.isFile && f.name.endsWith(".json") }?.forEach { if (it.name !in keep) it.delete() }
+    if (dir.listFiles()?.isEmpty() == true) dir.delete()
+}
+
+/** Remove a project's impact artifacts: the `<project>.impact.json` index and `<project>.impact/` shard dir. */
+private fun removeImpactFiles(outDir: File, project: String): Boolean {
+    val idx = File(outDir, "$project.impact.json").delete()
+    val dir = File(outDir, "$project.impact").takeIf { it.isDirectory }?.deleteRecursively() ?: false
+    return idx || dir
+}
+
 private fun cmdRefresh(opts: Opts) {
     val repo = File(opts["--repo"] ?: DEFAULT_REPO)
     val outDir = File(opts["--out-dir"] ?: "./json").also { it.mkdirs() }
@@ -290,9 +312,10 @@ private fun cmdRefresh(opts: Opts) {
         if (!isBackendSibling && Manifest.isFrontendGraph(f)) return@forEach  // a frontend graph, not a ghost
         f.delete(); System.err.println("  ~ pruned ghost ${f.name}")
     }
-    // also prune ghost PR-shard directories (`<project>.pulls/`) for absent projects
-    outDir.listFiles { f -> f.isDirectory && f.name.endsWith(".pulls") }?.forEach { d ->
-        if (d.name.removeSuffix(".pulls") !in liveBases && d.deleteRecursively())
+    // also prune ghost shard directories (`<project>.pulls/`, `<project>.impact/`) for absent projects
+    outDir.listFiles { f -> f.isDirectory && (f.name.endsWith(".pulls") || f.name.endsWith(".impact")) }?.forEach { d ->
+        val b = d.name.removeSuffix(".pulls").removeSuffix(".impact")
+        if (b !in liveBases && d.deleteRecursively())
             System.err.println("  ~ pruned ghost ${d.name}/")
     }
 
@@ -359,7 +382,7 @@ private fun cmdRefresh(opts: Opts) {
                             failed++
                         }
                         pulls.isEmpty() -> {           // gh ran, no merged PRs: drop stale impact + pull-files so they aren't served
-                            val rm = impactFile.delete() or removePullFiles(outDir, p.name)
+                            val rm = removeImpactFiles(outDir, p.name) or removePullFiles(outDir, p.name)
                             System.err.println("  · ${p.name}: no merged PRs for base $branch — skip" + if (rm) " (removed stale artifacts)" else "")
                             skipped++
                         }
@@ -367,9 +390,10 @@ private fun cmdRefresh(opts: Opts) {
                             val ok = try {
                                 System.err.println("  → ${p.name}: ${pulls.size} PRs — analyzing impact…")
                                 val result = Impact.analyze(p, branch, pulls, combined)
-                                impactFile.writeText(JsonOutput.writeValue(result))
+                                impactFile.writeText(JsonOutput.writeValue(result.index))
+                                writeImpactShards(outDir, p.name, result.shards)
                                 impactCount++
-                                System.err.println("  ✓ ${p.name}.impact.json (${pulls.size} PRs, ${result["changedNodeCount"]} changed nodes, ${result["breakingDeletionCount"]} breaking deletions)")
+                                System.err.println("  ✓ ${p.name}.impact.json + ${p.name}.impact/ (${pulls.size} PRs, ${result.index["changedNodeCount"]} changed nodes, ${result.index["impactedEndpointCount"]} impacted endpoints, ${result.index["breakingDeletionCount"]} breaking)")
                                 true
                             } catch (e: Exception) {
                                 System.err.println("  ✗ ${p.name}: impact analysis FAILED — ${e.message}")
@@ -466,14 +490,17 @@ private fun cmdImpact(opts: Opts) {
     }
     System.err.println("impact: ${git.name} base $branch, ${pulls.size} PRs")
     val result = Impact.analyze(git, branch, pulls, graph)
-    val text = JsonOutput.writeValue(result)
     val out = opts["--out"]
     if (out != null) {
-        File(out).writeText(text)
-        System.err.println("wrote $out: ${pulls.size} PRs, ${result["changedNodeCount"]} changed nodes, " +
-            "${result["changedPublicMethodCount"]} changed public methods, ${result["breakingDeletionCount"]} breaking deletions")
+        val outFile = File(out)
+        outFile.writeText(JsonOutput.writeValue(result.index))
+        // heavy per-PR shards next to the index: <base>.impact/<number>.json
+        val base = outFile.name.removeSuffix(".json").removeSuffix(".impact")
+        writeImpactShards(outFile.absoluteFile.parentFile ?: File("."), base, result.shards)
+        System.err.println("wrote $out + $base.impact/: ${pulls.size} PRs, ${result.index["changedNodeCount"]} changed nodes, " +
+            "${result.index["impactedEndpointCount"]} impacted endpoints, ${result.index["breakingDeletionCount"]} breaking")
     } else {
-        println(text)
+        println(JsonOutput.writeValue(result.index))
     }
     // Optional separate artifact: per-PR file-level diffs (status + patch) via gh api,
     // split into a light `<project>.pulls.json` index + `<project>.pulls/<number>.json`

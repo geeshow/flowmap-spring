@@ -34,8 +34,11 @@ object Sync {
     private fun isArtifact(f: File): Boolean =
         f.isFile && f.name.endsWith(".json") && !f.name.startsWith("_") && f.name != "manifest.json"
 
-    /** A `<project>.pulls/` directory of lazy-loaded per-PR file-diff shards. */
-    private fun isShardDir(f: File): Boolean = f.isDirectory && f.name.endsWith(".pulls")
+    /** A lazy-loaded per-PR shard directory: `<project>.pulls/` (file diffs) or `<project>.impact/` (change detail). */
+    private fun isShardDir(f: File): Boolean = f.isDirectory && (f.name.endsWith(".pulls") || f.name.endsWith(".impact"))
+
+    /** Project base name of a shard dir (strips `.pulls`/`.impact`). */
+    private fun shardBaseOf(name: String): String = name.removeSuffix(".pulls").removeSuffix(".impact")
 
     /**
      * Delete an artifact AND its optional gzip companion (`<f>.gz`, written by the web
@@ -111,8 +114,10 @@ object Sync {
             if (!(frontend && syncedFrontend || !frontend && syncedBackend)) return@forEach  // type not synced — leave it
             val kind = if (frontend) "frontend" else "backend"
             dest.listFiles { f -> isArtifact(f) && baseOf(f.name) == base }?.forEach { pruneArtifact(it, "pruned departed $kind") }
-            File(dest, "$base.pulls").takeIf { it.isDirectory }?.let {
-                if (it.deleteRecursively()) System.err.println("    ~ pruned departed $kind $base.pulls/")
+            listOf("$base.pulls", "$base.impact").forEach { dn ->
+                File(dest, dn).takeIf { it.isDirectory }?.let {
+                    if (it.deleteRecursively()) System.err.println("    ~ pruned departed $kind $dn/")
+                }
             }
         }
         // (3a) stale-sibling prune: sibling of a still-present graph not re-synced this run.
@@ -120,10 +125,10 @@ object Sync {
             if (f.name in sourceNames) return@forEach          // freshly synced — keep
             if (baseOf(f.name) in syncedGraphBases) pruneArtifact(f, "pruned stale")
         }
-        // (3b) same stale rule for `<project>.pulls/` shard dirs of still-present graphs.
+        // (3b) same stale rule for `<project>.pulls/` and `<project>.impact/` shard dirs of still-present graphs.
         dest.listFiles { f -> isShardDir(f) }?.forEach { d ->
             if (d.name in sourceShardDirs) return@forEach       // freshly mirrored — keep
-            if (d.name.removeSuffix(".pulls") in syncedGraphBases && d.deleteRecursively())
+            if (shardBaseOf(d.name) in syncedGraphBases && d.deleteRecursively())
                 System.err.println("    ~ pruned stale ${d.name}/")
         }
         val projects = Manifest.write(dest, "manifest.json")
