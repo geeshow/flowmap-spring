@@ -630,14 +630,34 @@ private fun cmdCombine(opts: Opts) {
         }
     }
     val graphs = usable.map { JsonOutput.read(File(it).readText()) }
-    // combine works on prebuilt graph JSONs (no source tree) → no auto-discovery here;
-    // pass an explicit --gateway-routes to add a gateway. refresh auto-discovers.
+    // Output dir: parent of --out if given, else the scanned --dir, else cwd. Per-project
+    // artifacts (and the manifest) live here.
+    val manifestDir = opts["--out"]?.let { File(it).absoluteFile.parentFile }
+        ?: opts["--dir"]?.let { File(it) }
+        ?: File(".")
     val gateways = ArrayList<Gateway.Source>()
     opts["--gateway-routes"]?.let { path ->
         val name = opts["--gateway-name"] ?: File(path).nameWithoutExtension
         val r = Gateway.load(path, name)
         System.err.println("gateway: loaded ${r.size} routes from $path (as '$name')")
         if (r.isNotEmpty()) gateways.add(Gateway.Source(name, r))
+    }
+    // With --repo, AUTO-DISCOVER gateways from the source tree (like refresh) so the granular
+    // analyze→merge pipeline also wires `gateway` edges AND emits each gateway project's route
+    // table (<name>.gateway.json) for the web front→backend join. (combine on prebuilt graphs
+    // alone has no source tree, so this is opt-in via --repo.)
+    opts["--repo"]?.let { repoPath ->
+        val repo = File(repoPath)
+        for (u in discoverUnits(repo)) {
+            val routes = u.gatewayDirs().flatMap { Gateway.discover(it) }
+            if (routes.isEmpty()) continue
+            gateways.add(Gateway.Source(u.name, routes))
+            // write next to the project's existing graph: folder layout if present, else flat.
+            val folder = File(manifestDir, "projects/${u.name}")
+            val dest = (if (folder.isDirectory) folder else manifestDir).also { it.mkdirs() }
+            writeGatewayRoutes(dest, u.name, routes)
+            System.err.println("gateway: discovered ${routes.size} routes in ${u.name} -> ${dest.name}/${u.name}.gateway.json")
+        }
     }
     val result = CrossRun.combine(graphs, gateways)
     val s2s = result.edges.count { it.kind == EdgeKind.S2S }
@@ -651,11 +671,7 @@ private fun cmdCombine(opts: Opts) {
     dump(result, opts["--out"], meta)
     System.err.println("combined ${usable.size} graphs: ${result.nodes.size} nodes, ${result.edges.size} edges, $s2s s2s, $gw gateway")
 
-    // Lightweight manifest (additive). Target the output directory: parent of
-    // --out if given, else the scanned --dir, else the cwd.
-    val manifestDir = opts["--out"]?.let { File(it).absoluteFile.parentFile }
-        ?: opts["--dir"]?.let { File(it) }
-        ?: File(".")
+    // Lightweight manifest (additive), written into the same output dir computed above.
     if (manifestDir.isDirectory) {
         val n = Manifest.write(manifestDir)
         System.err.println("manifest: ${manifestDir.path}/_manifest.json ($n projects)")
@@ -755,7 +771,8 @@ private fun usage() {
           impact  --git <repo> (--graph g.json | --repo <dir> --project P) [--branch b] [--max N (default 10)] [--out f.json] [--pull-files <dir>] [--refetch-pull-files]
                   # change-impact per merged PR (git-first: `git log --first-parent`; falls back to `gh` only if git finds no PR markers)
                   # --pull-files <dir>: also write a <project>.pulls.json index + <project>.pulls/<number>.json shards (lazy-load, incremental)
-          combine --graphs a.json,b.json,... | --dir <dir of *.json> [--gateway-routes routes.yml] [--gateway-name N] [--out f.json]
+          combine --graphs a.json,b.json,... | --dir <dir of *.json> [--repo <dir>] [--gateway-routes routes.yml] [--gateway-name N] [--out f.json]
+                  # --repo: auto-discover gateway routes from the source tree → wire gateway edges + emit <name>.gateway.json
           sync    --out-dir <analyzer out> --sync-dir <web data dir> [--frontend-dir d1,d2]
                   # assemble the web data dir from existing artifacts (refresh's step 7, standalone) — run AFTER the frontend analyzer
           search  --method M [--graph g.json | --repo <dir>] [--direction both|callers|callees] [--depth N] [--out f]
