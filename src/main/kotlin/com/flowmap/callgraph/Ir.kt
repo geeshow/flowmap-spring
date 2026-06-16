@@ -157,11 +157,24 @@ sealed interface CallResolution {
  * (kotlin-compiler-embeddable) implementation could be dropped in unchanged.
  */
 interface Resolver {
-    /** Analyze a repo root, returning the fully-resolved IR per project. */
+    /**
+     * Analyze a repo root, returning the fully-resolved IR per project.
+     *
+     * Legacy mode ([sourcePaths]/[projectName] null): [projectFilter] selects a single
+     * top-level subdir (or the whole root) and each file's project/module is derived
+     * from its path segments.
+     *
+     * Sub-project mode ([sourcePaths]/[projectName] set): only the given repo-relative
+     * [sourcePaths] are analyzed, and EVERY resulting file is stamped with [projectName]
+     * (module = the matched source path's leaf). Used to split a `wallga.yml` monorepo
+     * into its deployable sub-projects.
+     */
     fun analyze(
         repoRoot: String,
         projectFilter: String?,
         profile: String?,
         extraProps: Map<String, String>,
+        sourcePaths: List<String>? = null,
+        projectName: String? = null,
     ): List<IrFile>
 }
