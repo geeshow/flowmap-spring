@@ -1,4 +1,4 @@
-# flowmap-spring-kotlin 분석기 매뉴얼
+# flowmap-spring 분석기 매뉴얼
 
 Spring(Kotlin/Java) 멀티서비스 코드베이스를 **Kotlin 컴파일러 K1 프론트엔드(PSI +
 BindingContext)** 로 정적 분석해서 ① 콜그래프, ② 서비스 간(S2S) 통합 그래프, ③ OpenAPI

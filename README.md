@@ -154,6 +154,23 @@ flowchart LR
 
 ---
 
+## 설정 (필수)
+
+`flowmap.config.example` → `flowmap.config` 로 복사한 뒤 아래 키를 채운다. real `flowmap.config` 은
+머신별 설정이라 **gitignore 대상**이고, 템플릿 `flowmap.config.example` 만 추적된다.
+
+| 키 | 필수 | 설명 |
+|---|:--:|---|
+| `REPO` | ✅ | 분석 대상 소스 체크아웃 루트(`.repo/<project>/` 관례) |
+| `OUT_DIR` | | 분석기 스테이징 디렉터리(기본 `json`) |
+| `SYNC_DIR` | | 웹앱 data 디렉터리: per-project 산출물 + manifest.json 취합 |
+| `FRONTEND_DIR` | | 프론트/nexcore json(CSV) — `SYNC_DIR` 로 함께 취합 |
+| `PUBLIC_ONLY` · `COMMAND` · `EXTRA_ARGS` | | 공개 메서드 한정 / subcommand / 추가 플래그 |
+
+```bash
+cp flowmap.config.example flowmap.config   # REPO 등 값 작성 후 ./gradlew run
+```
+
 ## 빠른 시작
 
 ```bash

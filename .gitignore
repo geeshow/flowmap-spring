@@ -11,10 +11,8 @@ out/
 *.iml
 .DS_Store
 
-# --- local config -------------------------------------------------------------
-# Machine-specific run config (absolute OUT_DIR etc.). The committed template is
-# flowmap.config.example.
-flowmap.config
+# --- 머신별 실행 설정(real). 템플릿 flowmap.config.example 만 추적 ---
+/flowmap.config
 
 # --- generated analysis output ------------------------------------------------
 # Analysis output embeds analyzed-project internals (package names, file paths,

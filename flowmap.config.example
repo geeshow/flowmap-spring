@@ -1,23 +1,17 @@
-# flowmap.config — read when the analyzer is launched with no args
-# (a bare `./gradlew run`). Copy to `flowmap.config` and edit for your machine.
-# Format: shell-style KEY=VALUE, `#` comments, ${VAR}/$VAR expansion.
-#
-# --- backend analyzer (./gradlew run) -----------------------------------------
-COMMAND=refresh
-# subcommand to run (default: refresh)
-REPO=.repo
-# analysis repo root        -> --repo
-OUT_DIR=../docs/web/data
-# analyzer output dir       -> --out-dir
-# SYNC_DIR=../docs/web/data
-# web app data dir to assemble: copies per-project artifacts (+ FRONTEND_DIR's)
-# here and writes the app-facing manifest.json. Replaces scripts/sync-data.sh.
-# FRONTEND_DIR=../../flowmap-react/json
-# ts-analyzer output dir(s), comma-separated -> --frontend-dir (pulled into SYNC_DIR)
-# PUBLIC_ONLY=true
-# keep only public methods; contract public->private->public into public->public
-# EXTRA_ARGS=--no-pull --no-impact  # any extra flags, appended verbatim
+# flowmap.config — flowmap-spring(백엔드 분석기) 실행 설정.
+#   인자 없는 `./gradlew run` 과 scripts/NN-*.sh 가 이 파일을 읽는다.
+# 사용법: 이 파일을 `flowmap.config` 로 복사한 뒤 값을 채운다.
+#   real(flowmap.config) 은 머신별 설정이라 .gitignore 대상이고, 템플릿(flowmap.config.example)만 추적된다.
+# 형식: KEY=VALUE, '#' 주석, ${VAR}/$VAR 치환(앞 키 → 환경변수 순).
 
-# --- frontend ts-analyzer (used by its own runner, ignored by the backend) ----
-NAME=graph
-BACKEND=${OUT_DIR}/_combined.json
+# ───────────── 필수 (required) ─────────────
+# 분석 대상 소스 체크아웃 루트 (.repo/<project>/ 관례)        -> --repo
+REPO=.repo
+
+# ───────────── 선택 (optional) ─────────────
+# COMMAND=refresh                 # 실행 subcommand (analyze|merge|openapi|impact|refresh)
+# OUT_DIR=json                    # 분석기 staging 디렉터리 (_combined/_openapi/_manifest 보관) -> --out-dir
+# SYNC_DIR=../docs/web/data   # 웹앱 data 디렉터리: per-project 산출물 + manifest.json 취합
+# FRONTEND_DIR=../flowmap-react/json  # 프론트/nexcore json (CSV) — SYNC_DIR 로 함께 취합 -> --frontend-dir
+# PUBLIC_ONLY=true                # 공개 메서드만 유지(public->private->public 을 public->public 으로 계약)
+# EXTRA_ARGS=--no-pull --no-impact    # 추가 플래그(끝에 그대로 덧붙임)

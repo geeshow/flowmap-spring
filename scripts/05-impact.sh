@@ -1,13 +1,13 @@
 #!/usr/bin/env sh
 # impact.sh — refresh step 5: per-project PR impact against the combined graph.
 # Writes OUT_DIR/<project>.impact.json (+ <project>.pulls.json / <project>.pulls/).
-# Needs _combined.json (run 3-merge.sh first) and `gh`/git PR history per project.
+# Needs _combined.json (run 03-merge.sh first) and `gh`/git PR history per project.
 # Usage: ./scripts/impact.sh [extra impact flags... e.g. --max 50]
 set -e
 . "$(dirname "$0")/_common.sh"
 
 GRAPH="$OUT_DIR/_combined.json"
-[ -f "$GRAPH" ] || { echo "missing $GRAPH — run ./scripts/3-merge.sh first"; exit 1; }
+[ -f "$GRAPH" ] || { echo "missing $GRAPH — run ./scripts/03-merge.sh first"; exit 1; }
 
 projects | while read -r p; do
   name=$(basename "$p")

@@ -1,1 +1,1 @@
-rootProject.name = "flowmap-spring-kotlin"
+rootProject.name = "flowmap-spring"
