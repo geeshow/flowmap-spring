@@ -43,7 +43,11 @@ import java.io.File
  * project fqcn / simple-name maps (enabling Java->Java and Kotlin<->Java edges),
  * then [build] the IR with those maps.
  */
-class JavaSourceAnalyzer(private val project: Project, private val root: File) {
+class JavaSourceAnalyzer(
+    private val project: Project,
+    private val root: File,
+    private val provenance: (String) -> Pair<String?, String?>,
+) {
 
     private val factory = PsiFileFactory.getInstance(project)
 
@@ -84,12 +88,6 @@ class JavaSourceAnalyzer(private val project: Project, private val root: File) {
     ): List<IrFile> {
         val b = Builder(projectFqcns, simpleToFqcn)
         return parsed.mapNotNull { try { b.buildFile(it) } catch (_: Throwable) { null } }
-    }
-
-    private fun provenance(absPath: String): Pair<String?, String?> {
-        val rel = File(absPath).relativeToOrNull(root)?.path ?: return null to null
-        val parts = rel.split(File.separator)
-        return parts.getOrNull(0) to parts.getOrNull(1)
     }
 
     private inner class Builder(
