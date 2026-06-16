@@ -310,6 +310,25 @@ private fun discoverUnits(repo: File): List<RefreshUnit> {
 /** Staging output dir for one project: `<outDir>/projects/<name>/` (created on demand). */
 private fun projectDir(outDir: File, name: String): File = File(outDir, "projects/$name").also { it.mkdirs() }
 
+/**
+ * Write a gateway project's route table to `<projectDir>/<name>.gateway.json`. The web app
+ * loads this to resolve front→backend joins through the gateway: a front call to a route's
+ * `publicPrefix` is rewritten by `backendPrefix` and matched against the backend endpoint —
+ * far more precise than stripping the first path segment.
+ */
+private fun writeGatewayRoutes(projectDir: File, name: String, routes: List<Gateway.Route>) {
+    val doc = linkedMapOf<String, Any?>(
+        "command" to "gateway", "name" to name, "routeCount" to routes.size,
+        "routes" to routes.map { r ->
+            linkedMapOf<String, Any?>(
+                "routeId" to r.routeId, "publicPrefix" to r.publicPrefix, "backendPrefix" to r.backendPrefix,
+                "targetService" to r.targetService, "methods" to r.methods, "uri" to r.uri,
+            )
+        },
+    )
+    File(projectDir, "$name.gateway.json").writeText(JsonOutput.writeValue(doc))
+}
+
 private fun cmdRefresh(opts: Opts) {
     val repo = File(opts["--repo"] ?: DEFAULT_REPO)
     val outDir = File(opts["--out-dir"] ?: "./json").also { it.mkdirs() }
@@ -388,6 +407,14 @@ private fun cmdRefresh(opts: Opts) {
         val r = u.gatewayDirs().flatMap { Gateway.discover(it) }
         if (r.isNotEmpty()) { gateways.add(Gateway.Source(u.name, r)); seenGw.add(u.name)
             System.err.println("  gateway: discovered ${r.size} routes in ${u.name}") }
+    }
+    // Emit each gateway PROJECT's route table as a per-project sibling
+    // (projects/<gw>/<gw>.gateway.json) so the web app can join front→backend through the
+    // gateway's real publicPrefix→backendPrefix transform (not a strip-first-segment guess).
+    for (src in gateways) {
+        if (src.name !in liveBases) continue   // only gateways that are themselves analyzed projects
+        writeGatewayRoutes(projectDir(outDir, src.name), src.name, src.routes)
+        System.err.println("  + projects/${src.name}/${src.name}.gateway.json (${src.routes.size} routes)")
     }
     val combined = CrossRun.combine(builtGraphs, gateways)
     val s2s = combined.edges.count { it.kind == EdgeKind.S2S }
@@ -646,7 +673,8 @@ private fun collectGraphPaths(opts: Opts): List<String> {
         // also drops anything that slips through.
         File(dir).listFiles { f ->
             f.isFile && f.name.endsWith(".json") && !f.name.startsWith("_") && f.name != "manifest.json" &&
-                !f.name.endsWith(".openapi.json") && !f.name.endsWith(".impact.json") && !f.name.endsWith(".pulls.json")
+                !f.name.endsWith(".openapi.json") && !f.name.endsWith(".impact.json") &&
+                !f.name.endsWith(".pulls.json") && !f.name.endsWith(".gateway.json")
         }?.sortedBy { it.name }?.forEach { out.add(it.path) }
     }
     return out.toList()

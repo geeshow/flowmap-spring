@@ -62,7 +62,7 @@ object Sync {
     /** Project base name of an artifact (strips the graph/sibling suffix). */
     private fun baseOf(name: String): String = name
         .removeSuffix(".openapi.json").removeSuffix(".impact.json").removeSuffix(".pulls.json")
-        .removeSuffix(".join.json").removeSuffix(".screens.json").removeSuffix(".json")
+        .removeSuffix(".gateway.json").removeSuffix(".join.json").removeSuffix(".screens.json").removeSuffix(".json")
 
     /**
      * A project's artifacts gathered from one source. Each entry pairs the SOURCE file/dir
@@ -76,7 +76,7 @@ object Sync {
     )
 
     // Canonical sibling suffixes (used in `<base>.<suffix>` form) the web data dir expects.
-    private val SIBLING_SUFFIXES = listOf("openapi.json", "impact.json", "pulls.json", "join.json", "screens.json")
+    private val SIBLING_SUFFIXES = listOf("openapi.json", "impact.json", "pulls.json", "gateway.json", "join.json", "screens.json")
 
     /** Source subdirs whose children are per-service folders, keyed by FOLDER name (the project). */
     private val FOLDER_GROUPS = listOf("projects", "service", "frontend")
