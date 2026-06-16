@@ -3,7 +3,7 @@
 # Config (REPO / OUT_DIR / SYNC_DIR / FRONTEND_DIR) is read from flowmap.config when
 # present, then overridden by any matching environment variable, then defaults.
 # Each step is independently runnable; the usual order is:
-#   1-pull.sh -> 2-analyze.sh -> 3-merge.sh -> 4-openapi.sh -> 5-impact.sh -> 6-sync.sh
+#   01-pull.sh -> 02-analyze.sh -> 03-merge.sh -> 04-openapi.sh -> 05-impact.sh -> 06-sync.sh
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
@@ -16,7 +16,7 @@ OUT_DIR="${OUT_DIR:-$(cfg OUT_DIR)}";     OUT_DIR="${OUT_DIR:-json}"
 SYNC_DIR="${SYNC_DIR:-$(cfg SYNC_DIR)}"
 FRONTEND_DIR="${FRONTEND_DIR:-$(cfg FRONTEND_DIR)}"
 
-BIN="build/install/flowmap-spring-kotlin/bin/flowmap-spring-kotlin"
+BIN="build/install/flowmap-spring/bin/flowmap-spring"
 # build the CLI if it isn't installed yet (incremental; no-op when up to date)
 [ -x "$BIN" ] || ./gradlew -q installDist
 

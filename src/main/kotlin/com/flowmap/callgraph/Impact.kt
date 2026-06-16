@@ -32,7 +32,16 @@ object Impact {
     /** Split output: the lean [index] plus per-PR-number heavy [shards]. */
     class Result(val index: Map<String, Any?>, val shards: Map<Int, Map<String, Any?>>)
 
-    fun analyze(repo: File, base: String, pulls: List<GitHub.Pr>, graph: CallGraph): Result {
+    /**
+     * @param pathFilter when non-null, a PR's changed files are restricted to those it
+     *   accepts (repo-relative path). Used to attribute a monorepo's PRs to one
+     *   `wallga.yml` sub-project: a PR that touches none of the sub-project's `build.path`
+     *   files is dropped from that sub-project's impact entirely.
+     */
+    fun analyze(
+        repo: File, base: String, pulls: List<GitHub.Pr>, graph: CallGraph,
+        pathFilter: ((String) -> Boolean)? = null,
+    ): Result {
         val webBase = GitLog.webBaseUrl(repo)
         val nodeById = graph.nodes.associateBy { it.id }
         // callers adjacency: target id -> source ids (for the reverse walk to endpoints)
@@ -50,7 +59,11 @@ object Impact {
             for (pr in pulls) {
                 val sha = pr.mergeCommit ?: continue
                 val parent = GitLog.firstParent(repo, sha)
-                val changes = GitLog.changesIn(repo, sha)
+                val changes = GitLog.changesIn(repo, sha).let { all ->
+                    if (pathFilter == null) all
+                    else all.filter { pathFilter(it.path) || (it.oldPath?.let(pathFilter) ?: false) }
+                }
+                if (pathFilter != null && changes.isEmpty()) continue   // PR doesn't touch this sub-project
                 // id -> the changed method's parsed range (carries visibility); first-seen wins.
                 val changedFns = LinkedHashMap<String, PsiSourceParser.FnRange>()
                 val deletedIds = LinkedHashSet<String>()
@@ -137,7 +150,8 @@ object Impact {
             .thenBy { it["pathStillServed"] == true })
 
         val index = linkedMapOf<String, Any?>(
-            "base" to base, "repoUrl" to webBase, "pullCount" to pulls.size,
+            "base" to base, "repoUrl" to webBase,
+            "pullCount" to if (pathFilter != null) perPullIndex.size else pulls.size,
             "changedNodeCount" to allChangedInGraph.size,
             "impactedEndpointCount" to allImpacted.size,
             "deletedEndpointCount" to deletedEndpoints.size,

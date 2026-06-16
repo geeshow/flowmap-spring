@@ -1,4 +1,4 @@
-# flowmap-spring-kotlin
+# flowmap-spring
 
 Spring **Kotlin/Java** 프로젝트를 정적 분석해서, 메서드 사이의 **호출/피호출 흐름**을
 **node-link 그래프(`nodes[] + edges[]`) JSON**으로 뽑아내는 도구입니다.
@@ -154,6 +154,23 @@ flowchart LR
 
 ---
 
+## 설정 (필수)
+
+`flowmap.config.example` → `flowmap.config` 로 복사한 뒤 아래 키를 채운다. real `flowmap.config` 은
+머신별 설정이라 **gitignore 대상**이고, 템플릿 `flowmap.config.example` 만 추적된다.
+
+| 키 | 필수 | 설명 |
+|---|:--:|---|
+| `REPO` | ✅ | 분석 대상 소스 체크아웃 루트(`.repo/<project>/` 관례) |
+| `OUT_DIR` | | 분석기 스테이징 디렉터리(기본 `json`) |
+| `SYNC_DIR` | | 웹앱 data 디렉터리: per-project 산출물 + manifest.json 취합 |
+| `FRONTEND_DIR` | | 프론트/nexcore json(CSV) — `SYNC_DIR` 로 함께 취합 |
+| `PUBLIC_ONLY` · `COMMAND` · `EXTRA_ARGS` | | 공개 메서드 한정 / subcommand / 추가 플래그 |
+
+```bash
+cp flowmap.config.example flowmap.config   # REPO 등 값 작성 후 ./gradlew run
+```
+
 ## 빠른 시작
 
 ```bash
@@ -203,7 +220,48 @@ flowchart LR
 분석하려는 실제 프로젝트는 `.repo/<your-project>/`에 넣으면 됩니다. `.gitignore`가
 이 데모들 외의 `.repo/*`, 그리고 **분석 산출물**(`graph.json` 등)을
 **커밋에서 제외**합니다 — 사내/외부 소스나 결과물이 실수로 공개되지 않도록.
-(분석기 산출물은 `./json/`에 쌓입니다.)
+
+### 산출물 레이아웃 — `json/projects/<프로젝트>/`
+
+`refresh` 는 프로젝트별 산출물을 **`json/projects/<프로젝트명>/`** 폴더로 분리해서 씁니다:
+
+```
+json/
+├── _combined.json   _openapi.json   _manifest.json     # 저장소 전체 집계
+└── projects/
+    └── <프로젝트>/
+        ├── <프로젝트>.json            # 호출그래프
+        ├── <프로젝트>.openapi.json    # OpenAPI
+        ├── <프로젝트>.impact.json     # 커밋/PR 영향도 인덱스
+        ├── <프로젝트>.impact/<PR>.json  # PR별 상세 샤드(지연 로드)
+        └── <프로젝트>.pulls.json + <프로젝트>.pulls/<PR>.json  # PR 파일 diff
+```
+
+### `wallga.yml` — 모노레포를 배포 단위(sub-project)로 분리
+
+한 git 저장소가 여러 독립 배포 단위를 묶은 **모노레포**라면, 루트의 `wallga.yml` 로
+경계를 재정의합니다. `advanced.sub_project.projects.<키>` 의 `general.project_name`(프로젝트명)
+과 `build.path`(소스 디렉터리 목록)를 읽어, **각 sub-project 를 독립 프로젝트로** 분석합니다
+(`json/projects/<project_name>/`). `wallga.yml` 이 없으면 저장소 전체가 1개 프로젝트입니다.
+
+```yaml
+advanced:
+  sub_project:
+    projects:
+      niffler-api:
+        general: { project_name: niffler-api }
+        build:
+          path:
+            - app/niffler-api      # 이 경로(들)이 프로젝트 경계
+      niffler-consumer:
+        general: { project_name: niffler-consumer }
+        build: { path: [ app/niffler-consumer ] }
+```
+
+- 분석·OpenAPI 는 sub-project 의 `build.path` 소스만 대상으로 합니다.
+- 커밋/PR 영향도는 모노레포의 머지 PR 목록을 **한 번만** 가져온 뒤, 각 PR의 변경 파일을
+  sub-project 의 `build.path` 로 필터링해 **sub-project별로 귀속**합니다(해당 경로를 건드리지
+  않은 PR 은 제외).
 
 ---
 
@@ -242,13 +300,13 @@ flowchart LR
 ## 디렉토리 구조
 
 ```
-flowmap-spring-kotlin/          # 분석기 = 이 저장소 루트 (kotlin-compiler-embeddable, K1 프론트엔드)
+flowmap-spring/          # 분석기 = 이 저장소 루트 (kotlin-compiler-embeddable, K1 프론트엔드)
 ├── build.gradle.kts            # 분석기 Gradle 프로젝트
 ├── settings.gradle.kts
 ├── src/main/kotlin/com/flowmap/callgraph/   # 분석기 소스
 ├── MANUAL.md                   # 명령별 옵션 · 출력 스키마 · 웹 연동 상세
-├── json/                       # refresh 산출물 (gitignored)
-└── .repo/<프로젝트>/           # 분석 대상 소스 (sample-shop 등 데모 번들)
+├── json/                       # refresh 산출물 (gitignored) — projects/<프로젝트>/ + _집계
+└── .repo/<프로젝트>/           # 분석 대상 소스 (sample-shop 등 데모 번들; 모노레포면 wallga.yml)
 ```
 
 ## 라이선스

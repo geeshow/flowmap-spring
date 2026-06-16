@@ -59,15 +59,22 @@ class AnalysisSession : Resolver {
         projectFilter: String?,
         profile: String?,
         extraProps: Map<String, String>,
+        sourcePaths: List<String>?,
+        projectName: String?,
     ): List<IrFile> {
         val root = File(repoRoot).absoluteFile
-        val sourceRoots = discoverSourceRoots(root, projectFilter)
+        val pathRoots = sourcePaths?.map { it.replace('\\', '/').trimEnd('/') }?.filter { it.isNotEmpty() }
+        val sourceRoots = discoverSourceRoots(root, projectFilter, pathRoots)
         if (sourceRoots.isEmpty()) return emptyList()
+
+        // Provenance: sub-project mode stamps a fixed project name (module = the matched
+        // build.path leaf); legacy mode derives (project, module) from path segments.
+        val prov = Provenance(root, projectName, pathRoots)
 
         val disposable = Disposer.newDisposable("callgraph-analysis")
         try {
             val configuration = CompilerConfiguration().apply {
-                put(CommonConfigurationKeys.MODULE_NAME, projectFilter ?: "repo")
+                put(CommonConfigurationKeys.MODULE_NAME, projectName ?: projectFilter ?: "repo")
                 put(CLIConfigurationKeys.MESSAGE_COLLECTOR_KEY, MessageCollector.NONE)
                 addKotlinSourceRoots(sourceRoots.map { it.absolutePath })
                 // Put the analyzer's own runtime classpath (which bundles the Spring
@@ -116,7 +123,7 @@ class AnalysisSession : Resolver {
             // binding context) and Java->Java (resolved heuristically) calls become
             // internal edges. .kt files are analyzed by the Kotlin front-end above; Java
             // bodies are not (the front-end only reads Java signatures), so we walk them here.
-            val javaAnalyzer = JavaSourceAnalyzer(environment.project, root)
+            val javaAnalyzer = JavaSourceAnalyzer(environment.project, root, prov::of)
             val parsedJava = javaAnalyzer.parse(discoverJavaFiles(sourceRoots))
             for ((fq, simple) in javaAnalyzer.declaredTypes(parsedJava)) {
                 projectFqcns.add(fq)
@@ -126,7 +133,7 @@ class AnalysisSession : Resolver {
             val constEval = ConstantEvaluator(bc)
             val ext = ExternalResolver(constEval)
             val ymlCache = HashMap<String, YamlPropertyResolver>()
-            val builder = IrBuilder(bc, root, projectFqcns, simpleToFqcn, constEval, ext) { moduleDir ->
+            val builder = IrBuilder(bc, root, prov, projectFqcns, simpleToFqcn, constEval, ext) { moduleDir ->
                 ymlCache.getOrPut(moduleDir?.path ?: "_") {
                     if (moduleDir != null) YamlPropertyResolver.forModule(moduleDir, profile, extraProps)
                     else YamlPropertyResolver.fromProps(extraProps)
@@ -152,6 +159,7 @@ class AnalysisSession : Resolver {
     private inner class IrBuilder(
         val bc: BindingContext,
         val root: File,
+        val prov: Provenance,
         val projectFqcns: Set<String>,
         val simpleToFqcn: Map<String, String>,
         val constEval: ConstantEvaluator,
@@ -161,10 +169,8 @@ class AnalysisSession : Resolver {
         fun buildFile(kt: KtFile): IrFile? {
             val vpath = kt.virtualFile?.path ?: return null
             val relPath = File(vpath).relativeToOrNull(root)?.path ?: vpath
-            val (project, module) = provenance(vpath)
-            val moduleDir = if (project != null && module != null)
-                File(root, "$project${File.separator}$module") else null
-            val yml = ymlFor(moduleDir)
+            val (project, module) = prov.of(vpath)
+            val yml = ymlFor(prov.moduleDir(vpath))
             val types = kt.collectDescendantsOfType<KtClassOrObject>().map { buildType(it, kt, relPath, yml) }
             return IrFile(relPath, project, module, if (vpath.endsWith(".java")) "java" else "kotlin", types)
         }
@@ -393,12 +399,6 @@ class AnalysisSession : Resolver {
             return null
         }
 
-        private fun provenance(absPath: String): Pair<String?, String?> {
-            val rel = File(absPath).relativeToOrNull(root)?.path ?: return null to null
-            val parts = rel.split(File.separator)
-            return parts.getOrNull(0) to parts.getOrNull(1)
-        }
-
         // ---- infra resource extraction (PSI; classpath-independent string args) ----
 
         /** (isEntity, tableName). Default JPA table = entity simple name (lowercased later). */
@@ -498,16 +498,62 @@ class AnalysisSession : Resolver {
     private fun stripGenerics(t: String): String =
         t.substringBefore("<").substringAfterLast(".").trim().removeSuffix("?")
 
-    private fun discoverSourceRoots(root: File, projectFilter: String?): List<File> {
-        val base = if (projectFilter != null) File(root, projectFilter) else root
-        if (!base.isDirectory) return emptyList()
-        val srcRoots = base.walkTopDown()
-            .onEnter { it.name !in skipDirs }
-            .filter {
-                it.isDirectory && (it.name == "kotlin" || it.name == "java") &&
-                    it.path.contains("${File.separator}src${File.separator}")
-            }
-            .toList()
-        return srcRoots.ifEmpty { listOf(base) }
+    /**
+     * Source roots to feed the front-end. Sub-project mode ([pathRoots] non-null):
+     * the union of `src/{kotlin,java}` roots under each build.path dir. Legacy mode:
+     * under the single [projectFilter] subdir (or the whole root). Falls back to the
+     * base dir itself when no conventional src root is found.
+     */
+    private fun discoverSourceRoots(root: File, projectFilter: String?, pathRoots: List<String>?): List<File> {
+        val bases = when {
+            pathRoots != null -> pathRoots.map { File(root, it) }.filter { it.isDirectory }
+            projectFilter != null -> listOf(File(root, projectFilter))
+            else -> listOf(root)
+        }.filter { it.isDirectory }
+        if (bases.isEmpty()) return emptyList()
+        val srcRoots = bases.flatMap { base ->
+            base.walkTopDown()
+                .onEnter { it.name !in skipDirs }
+                .filter {
+                    it.isDirectory && (it.name == "kotlin" || it.name == "java") &&
+                        it.path.contains("${File.separator}src${File.separator}")
+                }
+                .toList()
+        }.distinctBy { it.absolutePath }
+        return srcRoots.ifEmpty { bases }
+    }
+
+    /**
+     * Maps a source file to its (project, module) and resource module dir. In sub-project
+     * mode every file gets the fixed [projectName]; the module + module dir come from the
+     * most specific matching [pathRoots] entry. In legacy mode project/module are the
+     * file's first two path segments under [root] and the module dir is `<project>/<module>`.
+     */
+    inner class Provenance(
+        private val root: File,
+        private val projectName: String?,
+        private val pathRoots: List<String>?,
+    ) {
+        fun of(absPath: String): Pair<String?, String?> {
+            val rel = relOf(absPath) ?: return null to null
+            if (projectName != null) return projectName to matched(rel)?.substringAfterLast('/')
+            val parts = rel.split('/')
+            return parts.getOrNull(0) to parts.getOrNull(1)
+        }
+
+        fun moduleDir(absPath: String): File? {
+            val rel = relOf(absPath) ?: return null
+            if (projectName != null) return matched(rel)?.let { File(root, it) }
+            val parts = rel.split('/')
+            val project = parts.getOrNull(0); val module = parts.getOrNull(1)
+            return if (project != null && module != null) File(root, "$project${File.separator}$module") else null
+        }
+
+        private fun relOf(absPath: String): String? =
+            File(absPath).relativeToOrNull(root)?.path?.replace('\\', '/')
+
+        /** The most specific build.path entry that contains [rel] (sub-project mode only). */
+        private fun matched(rel: String): String? =
+            pathRoots?.filter { rel == it || rel.startsWith("$it/") }?.maxByOrNull { it.length }
     }
 }

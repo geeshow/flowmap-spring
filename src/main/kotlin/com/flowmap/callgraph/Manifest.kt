@@ -35,19 +35,25 @@ object Manifest {
     private fun iso(instant: Instant): String =
         DateTimeFormatter.ISO_INSTANT.format(instant.atZone(java.time.ZoneOffset.UTC).toInstant())
 
+    /** True for a pure call-graph JSON: not an aggregate (`_*`) or sibling artifact. */
+    private fun isGraphFile(f: File): Boolean =
+        f.isFile && f.name.endsWith(".json") && !f.name.startsWith("_") &&
+            f.name != "manifest.json" &&  // app-facing manifest, not a project graph
+            !f.name.endsWith(".openapi.json") && !f.name.endsWith(".impact.json") &&
+            !f.name.endsWith(".pulls.json") &&
+            !f.name.endsWith(".join.json") && !f.name.endsWith(".screens.json")
+
     /**
-     * The same input filter `combine --dir` uses: pure call-graph JSONs only.
-     * Excludes `_*.json` (combine output like `_combined.json`) and sibling
-     * artifacts (`*.openapi.json`, `*.impact.json`, `*.join.json`, `*.screens.json`).
+     * Project graph JSONs under [dir]: both the FLAT layout (`<dir>/<name>.json`, e.g.
+     * frontend analyzers) and the per-project FOLDER layout (`<dir>/projects/<name>/<name>.json`,
+     * the backend's `wallga`/projects split). Same filter `combine --dir` uses.
      */
-    private fun projectGraphFiles(dir: File): List<File> =
-        dir.listFiles { f ->
-            f.isFile && f.name.endsWith(".json") && !f.name.startsWith("_") &&
-                f.name != "manifest.json" &&  // app-facing manifest, not a project graph
-                !f.name.endsWith(".openapi.json") && !f.name.endsWith(".impact.json") &&
-                !f.name.endsWith(".pulls.json") &&
-                !f.name.endsWith(".join.json") && !f.name.endsWith(".screens.json")
-        }?.sortedBy { it.name } ?: emptyList()
+    private fun projectGraphFiles(dir: File): List<File> {
+        val flat = dir.listFiles { f -> isGraphFile(f) }?.toList() ?: emptyList()
+        val nested = File(dir, "projects").listFiles { f -> f.isDirectory }
+            ?.flatMap { pd -> pd.listFiles { f -> isGraphFile(f) }?.toList() ?: emptyList() } ?: emptyList()
+        return (flat + nested).sortedBy { it.name }
+    }
 
     /** Frontend-only node layers — their presence marks a graph as a frontend graph. */
     private val FRONTEND_LAYERS = setOf("SCREEN", "HOOK", "STORE", "API")
@@ -78,11 +84,19 @@ object Manifest {
         val edges = meta?.get("edges")?.takeIf { it.isNumber }?.asInt()
             ?: (root["edges"]?.takeIf { it.isArray }?.size() ?: 0)
         val isFrontend = nodesArr?.any { it["layer"]?.asText() in FRONTEND_LAYERS } ?: false
-        fun sibling(suffix: String) = File(dir, "$base.$suffix").takeIf { it.isFile }?.name
+        // Path fields are RELATIVE TO [dir] (the data dir): a flat graph is just its file
+        // name; a folder-layout graph is `projects/<name>/<file>`. The web app fetches
+        // `data/<field>`, and impact/pull shard dirs are derived by stripping `.json`.
+        val parentRel = graphFile.parentFile.relativeToOrNull(dir)?.path?.replace(File.separatorChar, '/')?.ifEmpty { null }
+        fun rel(name: String) = if (parentRel == null) name else "$parentRel/$name"
+        fun sibling(suffix: String) = File(graphFile.parentFile, "$base.$suffix").takeIf { it.isFile }?.let { rel(it.name) }
+        // Project name = the FOLDER name in the folder layout (works whether the inner graph
+        // is `<name>.json` (backend) or `graph.json` (frontend)); the bare file base when flat.
+        val projectName = if (parentRel == null) base else graphFile.parentFile.name
         return linkedMapOf(
-            "name" to base,
+            "name" to projectName,
             "type" to if (isFrontend) "frontend" else "backend",
-            "graph" to graphFile.name,
+            "graph" to rel(graphFile.name),
             "openapi" to sibling("openapi.json"),
             "impact" to sibling("impact.json"),
             "pulls" to sibling("pulls.json"),
