@@ -96,6 +96,9 @@ object Manifest {
         return linkedMapOf(
             "name" to projectName,
             "type" to if (isFrontend) "frontend" else "backend",
+            // git work tree this service belongs to (frontend analyzer stamps meta.gitRepo);
+            // lets repo-level views group a monorepo's sibling sub-roots. Null when absent.
+            "repo" to meta?.get("gitRepo")?.takeIf { it.isTextual }?.asText(),
             "graph" to rel(graphFile.name),
             "openapi" to sibling("openapi.json"),
             "impact" to sibling("impact.json"),
