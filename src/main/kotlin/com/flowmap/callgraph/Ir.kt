@@ -168,6 +168,12 @@ interface Resolver {
      * [sourcePaths] are analyzed, and EVERY resulting file is stamped with [projectName]
      * (module = the matched source path's leaf). Used to split a `wallga.yml` monorepo
      * into its deployable sub-projects.
+     *
+     * Monorepo mode ([subProjects] set): the WHOLE root is analyzed in one pass (so calls
+     * into shared/common modules resolve and nothing is dropped), and each resulting file
+     * is stamped with its OWNING sub-project ([Wallga.owningProject]) — or, for code under
+     * no `build.path`, its top-level directory (shared module → its own project). The caller
+     * then partitions the single resolved graph by `node.project`.
      */
     fun analyze(
         repoRoot: String,
@@ -176,5 +182,6 @@ interface Resolver {
         extraProps: Map<String, String>,
         sourcePaths: List<String>? = null,
         projectName: String? = null,
+        subProjects: List<Wallga.SubProject>? = null,
     ): List<IrFile>
 }

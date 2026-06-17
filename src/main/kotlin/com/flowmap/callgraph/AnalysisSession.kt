@@ -61,15 +61,19 @@ class AnalysisSession : Resolver {
         extraProps: Map<String, String>,
         sourcePaths: List<String>?,
         projectName: String?,
+        subProjects: List<Wallga.SubProject>?,
     ): List<IrFile> {
         val root = File(repoRoot).absoluteFile
         val pathRoots = sourcePaths?.map { it.replace('\\', '/').trimEnd('/') }?.filter { it.isNotEmpty() }
+        // Monorepo mode scans the WHOLE root (no path restriction) so cross-module calls
+        // into shared code resolve; per-file project attribution is done in Provenance.
         val sourceRoots = discoverSourceRoots(root, projectFilter, pathRoots)
         if (sourceRoots.isEmpty()) return emptyList()
 
-        // Provenance: sub-project mode stamps a fixed project name (module = the matched
-        // build.path leaf); legacy mode derives (project, module) from path segments.
-        val prov = Provenance(root, projectName, pathRoots)
+        // Provenance: monorepo mode stamps each file with its owning sub-project (or its
+        // top-level dir, for shared code); sub-project mode stamps a fixed project name
+        // (module = the matched build.path leaf); legacy mode derives both from path segments.
+        val prov = Provenance(root, projectName, pathRoots, subProjects)
 
         val disposable = Disposer.newDisposable("callgraph-analysis")
         try {
@@ -524,26 +528,47 @@ class AnalysisSession : Resolver {
     }
 
     /**
-     * Maps a source file to its (project, module) and resource module dir. In sub-project
-     * mode every file gets the fixed [projectName]; the module + module dir come from the
-     * most specific matching [pathRoots] entry. In legacy mode project/module are the
-     * file's first two path segments under [root] and the module dir is `<project>/<module>`.
+     * Maps a source file to its (project, module) and resource module dir. In monorepo
+     * mode ([subProjects] set) each file's project is its owning sub-project (module = the
+     * matched build.path leaf), or — for code under no build.path — its top-level dir
+     * (project = module = that dir, so shared modules become their own project). In
+     * sub-project mode every file gets the fixed [projectName] (module = the matched
+     * [pathRoots] leaf). In legacy mode project/module are the file's first two path
+     * segments under [root] and the module dir is `<project>/<module>`.
      */
     inner class Provenance(
         private val root: File,
         private val projectName: String?,
         private val pathRoots: List<String>?,
+        private val subProjects: List<Wallga.SubProject>? = null,
     ) {
         fun of(absPath: String): Pair<String?, String?> {
             val rel = relOf(absPath) ?: return null to null
+            if (subProjects != null) {
+                val sp = Wallga.owningProject(rel, subProjects)
+                return if (sp != null) sp.name to matchedIn(rel, sp.paths)?.substringAfterLast('/')
+                       else bySegments(rel)   // shared/common code: attributed to its top-level dir
+            }
             if (projectName != null) return projectName to matched(rel)?.substringAfterLast('/')
-            val parts = rel.split('/')
-            return parts.getOrNull(0) to parts.getOrNull(1)
+            return bySegments(rel)
         }
 
         fun moduleDir(absPath: String): File? {
             val rel = relOf(absPath) ?: return null
+            if (subProjects != null) {
+                val sp = Wallga.owningProject(rel, subProjects)
+                return if (sp != null) matchedIn(rel, sp.paths)?.let { File(root, it) } else segmentDir(rel)
+            }
             if (projectName != null) return matched(rel)?.let { File(root, it) }
+            return segmentDir(rel)
+        }
+
+        private fun bySegments(rel: String): Pair<String?, String?> {
+            val parts = rel.split('/')
+            return parts.getOrNull(0) to parts.getOrNull(1)
+        }
+
+        private fun segmentDir(rel: String): File? {
             val parts = rel.split('/')
             val project = parts.getOrNull(0); val module = parts.getOrNull(1)
             return if (project != null && module != null) File(root, "$project${File.separator}$module") else null
@@ -552,8 +577,12 @@ class AnalysisSession : Resolver {
         private fun relOf(absPath: String): String? =
             File(absPath).relativeToOrNull(root)?.path?.replace('\\', '/')
 
-        /** The most specific build.path entry that contains [rel] (sub-project mode only). */
+        /** The most specific build.path entry (from [pathRoots]) that contains [rel] (sub-project mode only). */
         private fun matched(rel: String): String? =
             pathRoots?.filter { rel == it || rel.startsWith("$it/") }?.maxByOrNull { it.length }
+
+        /** The most specific entry of [paths] that contains [rel]. */
+        private fun matchedIn(rel: String, paths: List<String>): String? =
+            paths.filter { rel == it || rel.startsWith("$it/") }.maxByOrNull { it.length }
     }
 }
