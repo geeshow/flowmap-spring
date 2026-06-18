@@ -557,10 +557,12 @@ private fun runImpactStep(targets: List<ImpactTarget>, graph: CallGraph, outDir:
 }
 
 /**
- * The PR-impact targets for [repo] (granular `impact --out-dir`), derived WITHOUT re-analysis:
- * a wallga monorepo's sub-projects (attributed by `build.path`) plus any shared-module project
- * already emitted into `<outDir>/projects/<name>/` (attributed by its top-level dir); a legacy
- * repo dir is one whole-repo target. Only projects with an emitted graph are included.
+ * The PR-impact targets for [repo] (granular `impact --out-dir`), derived WITHOUT re-analysis.
+ * A legacy repo dir is one whole-repo target. A wallga monorepo is analyzed at the REPO LEVEL:
+ * ONE target named after the work tree, with NO `build.path` filter — every merged PR is counted
+ * once for the repo instead of being split/attributed across its sub-projects + shared modules.
+ * The repo-level impact is written to `projects/<repo>/<repo>.impact.json` (a graph-less folder).
+ * Only repos/projects that were actually analyzed (at least one emitted graph) are included.
  */
 private fun impactTargets(repo: File, outDir: File): List<ImpactTarget> {
     val emitted = { name: String -> File(outDir, "projects/$name/$name.json").isFile }
@@ -572,14 +574,13 @@ private fun impactTargets(repo: File, outDir: File): List<ImpactTarget> {
             if (emitted(name)) out.add(ImpactTarget(name, group.gitRoot, null))
             continue
         }
+        // Monorepo → one repo-level target. Guard: the repo was analyzed iff at least one of its
+        // projects (a sub-project OR a shared module under its root) has an emitted graph on disk.
         val subNames = subs.mapTo(HashSet()) { it.name }
-        for (sub in subs) if (emitted(sub.name)) out.add(ImpactTarget(sub.name, group.gitRoot) { p -> Wallga.matches(p, sub.paths) })
-        // shared modules: emitted projects under this monorepo's root that no build.path claims
-        File(outDir, "projects").listFiles { f -> f.isDirectory }?.sortedBy { it.name }?.forEach { d ->
-            val name = d.name
-            if (name in subNames || !emitted(name) || !File(group.analyzeRoot, name).isDirectory) return@forEach
-            out.add(ImpactTarget(name, group.gitRoot) { p -> p.replace('\\', '/').let { it == name || it.startsWith("$name/") } })
-        }
+        val sharedEmitted = File(outDir, "projects").listFiles { f -> f.isDirectory }
+            ?.any { d -> d.name !in subNames && emitted(d.name) && File(group.analyzeRoot, d.name).isDirectory } ?: false
+        if (subs.any { emitted(it.name) } || sharedEmitted)
+            out.add(ImpactTarget(group.analyzeRoot.name, group.gitRoot, null))
     }
     return out
 }
@@ -699,14 +700,19 @@ private fun cmdRefresh(opts: Opts) {
     val paths = (allOapi["paths"] as? Map<String, *>)?.size ?: 0
     System.err.println("  + _openapi.json ($paths paths)")
 
-    // 5) per-project PR analysis against the COMBINED graph (so cross-service breaking-change
-    // detection sees external callers): impact + lazy-loaded per-PR file diffs, written into
-    // `projects/<name>/`. Sub-projects of one monorepo share the repo's merged-PR list (fetched
-    // once, cached) and ATTRIBUTE each PR by filtering its changed files to their build.path.
+    // 5) PR analysis against the COMBINED graph (so cross-service breaking-change detection sees
+    // external callers): impact + lazy-loaded per-PR file diffs, written into `projects/<name>/`.
+    // A standalone project mines its own work tree; a monorepo is analyzed at the REPO LEVEL —
+    // its sub-projects collapse into ONE target (no build.path filter) so each PR is counted once
+    // for the repo, written to `projects/<repo>/<repo>.impact.json`.
     if (opts.has("--no-impact")) {
         System.err.println("[5/7] PR analysis: skipped (--no-impact)")
     } else {
-        runImpactStep(projects.map { ImpactTarget(it.name, it.gitRoot, it.pathFilter) }, combined, outDir, opts)
+        val targets = projects.groupBy { it.monorepo }.flatMap { (mono, units) ->
+            if (mono == null) units.map { ImpactTarget(it.name, it.gitRoot, null) }
+            else listOf(ImpactTarget(mono, units.first().gitRoot, null))
+        }
+        runImpactStep(targets, combined, outDir, opts)
     }
 
     // 6) lightweight manifest (additive — leaves _combined.json and friends intact)
@@ -786,8 +792,8 @@ private fun cmdOpenApi(opts: Opts) {
 
 private fun cmdImpact(opts: Opts) {
     // Folder mode (granular pipeline): per-project PR impact for the WHOLE --repo against the
-    // combined --graph, written into `<out-dir>/projects/<name>/`. Wallga-aware — a monorepo's
-    // sub-projects (+ shared modules) each get their own impact, attributed by build.path.
+    // combined --graph, written into `<out-dir>/projects/<name>/`. Wallga-aware — a monorepo is
+    // analyzed at the REPO LEVEL (one target, no build.path filter), counting each PR once.
     opts["--out-dir"]?.let { outPath ->
         val repo = File(opts["--repo"] ?: DEFAULT_REPO)
         val outDir = File(outPath)
