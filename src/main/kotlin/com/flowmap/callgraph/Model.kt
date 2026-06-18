@@ -61,6 +61,7 @@ data class MethodNode(
     val resourceType: String? = null, // RESOURCE node kind: "kafka-topic" | "redis" | "db-table"
     val description: String? = null,  // controller endpoint: REST Docs / API description
     val entryPoint: EntryPointKind? = null, // ADDITIVE: runtime entry-point kind (reachability root); null = not an entry point
+    val s2sService: String? = null,   // ADDITIVE: EXTERNAL 호출의 yml-host 기반 server-to-server 대상 프로젝트 (HostRegistry)
 ) {
     fun toJson(): LinkedHashMap<String, Any?> = linkedMapOf(
         "id" to id,
@@ -74,6 +75,7 @@ data class MethodNode(
         "endpoint" to endpoint,
         "externalService" to externalService,
         "externalUrl" to externalUrl,
+        "s2sService" to s2sService,
         "resourceType" to resourceType,
         "description" to description,
         "entryPoint" to entryPoint?.name,

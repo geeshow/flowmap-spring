@@ -168,9 +168,9 @@ private fun cmdAnalyze(opts: Opts) {
     opts["--out-dir"]?.let { outPath ->
         val repo = File(opts["--repo"] ?: DEFAULT_REPO)
         val outDir = File(outPath).also { it.mkdirs() }
-        val projects = discoverGroups(repo).flatMap {
+        val projects = stampS2S(discoverGroups(repo).flatMap {
             analyzeGroup(it, opts["--profile"], loadProps(opts["--props"]), opts.has("--include-other"), opts.has("--public-only"))
-        }
+        })
         if (projects.isEmpty()) { System.err.println("analyze: no projects found under ${repo.path}"); exitProcess(2) }
         val live = projects.mapTo(LinkedHashSet()) { it.name }
         // prune ghost project folders + legacy FLAT per-project graphs (pre-`projects/` layout)
@@ -183,8 +183,9 @@ private fun cmdAnalyze(opts: Opts) {
         }?.forEach { it.delete() }
         for (u in projects) {
             val pdir = projectDir(outDir, u.name)
-            File(pdir, "${u.name}.json").writeText(JsonOutput.write(u.graph, linkedMapOf(
-                "command" to "analyze", "project" to u.name, "nodes" to u.graph.nodes.size, "edges" to u.graph.edges.size)))
+            File(pdir, "${u.name}.json").writeText(JsonOutput.write(u.graph, linkedMapOf<String, Any?>(
+                "command" to "analyze", "project" to u.name, "nodes" to u.graph.nodes.size, "edges" to u.graph.edges.size)
+                .apply { u.monorepo?.let { put("gitRepo", it) } }))   // wallga 모노레포 마커 → manifest.repo
             System.err.println("  + projects/${u.name}/${u.name}.json (${u.graph.nodes.size} nodes, ${u.graph.edges.size} edges)")
         }
         return
@@ -361,6 +362,7 @@ private class ProjectUnit(
     val snippets: String?,                       // build/generated-snippets dir (REST Docs enrich), if any
     val gatewayDirs: List<File>,                 // dirs scanned for spring.cloud.gateway.routes
     val pathFilter: ((String) -> Boolean)?,      // restrict a PR's changed files to this project (impact); null = whole repo
+    val monorepo: String? = null,                // wallga monorepo this is a SUB-project of (root dir name); null = standalone
 )
 
 /**
@@ -449,8 +451,36 @@ private fun analyzeGroup(
         val filter: (String) -> Boolean =
             if (sub != null) { p -> Wallga.matches(p, sub.paths) }
             else { p -> p.replace('\\', '/').let { it == name || it.startsWith("$name/") } }
-        ProjectUnit(name, group.gitRoot, partition(full, name), files, snippetsIn(dirs), dirs, filter)
+        ProjectUnit(name, group.gitRoot, partition(full, name), files, snippetsIn(dirs), dirs, filter,
+            monorepo = group.analyzeRoot.name)
     }
+}
+
+/**
+ * Stamp every project's EXTERNAL nodes with their server-to-server target ([MethodNode.s2sService])
+ * by reading host info from ALL projects' application*.yml (every profile) — see [HostRegistry].
+ * A host configured for a known service in ANY environment links the call to that service; the web
+ * app then renders such external calls as s2s instead of a shared "external API" bucket. localhost
+ * 류는 제외. Tolerant: yml 부재/파싱 실패는 건너뛴다(빈 레지스트리 → 노드 힌트로만 해석).
+ */
+private fun stampS2S(projects: List<ProjectUnit>): List<ProjectUnit> {
+    val names = projects.map { it.name }
+    val normNames = names.map { it to it.lowercase().filter(Char::isLetterOrDigit) }
+    val registry = HostRegistry.build(projects.map { it.name to it.gatewayDirs }, names)
+    var stamped = 0
+    val out = projects.map { u ->
+        var changed = false
+        val newNodes = u.graph.nodes.map { n ->
+            if (n.layer != Layer.EXTERNAL) return@map n
+            val tgt = HostRegistry.resolve(n, registry, normNames, u.name)
+            if (tgt == null || tgt == u.name) n else { changed = true; stamped++; n.copy(s2sService = tgt) }
+        }
+        if (!changed) u
+        else ProjectUnit(u.name, u.gitRoot, CallGraph(newNodes, u.graph.edges), u.files, u.snippets,
+            u.gatewayDirs, u.pathFilter, u.monorepo)
+    }
+    System.err.println("  s2s(host): ${registry.size} hosts mapped, stamped $stamped external call(s) → server-to-server")
+    return out
 }
 
 /** One PR-impact target: a project [name], the git work tree to mine, and the optional
@@ -598,7 +628,7 @@ private fun cmdRefresh(opts: Opts) {
     // 2) analyze each group, then emit per project into `<outDir>/projects/<name>/` (graph +
     //    openapi siblings). A wallga monorepo is analyzed ONCE and split into its sub-projects
     //    (plus a stand-alone project per shared module) — see [analyzeGroup]/[partition].
-    val projects = groups.flatMap { analyzeGroup(it, profile, props, includeOther, publicOnly) }
+    val projects = stampS2S(groups.flatMap { analyzeGroup(it, profile, props, includeOther, publicOnly) })
     val builtGraphs = ArrayList<CallGraph>()
     val allFiles = ArrayList<IrFile>()
     val liveBases = LinkedHashSet<String>()
@@ -607,8 +637,9 @@ private fun cmdRefresh(opts: Opts) {
         allFiles.addAll(u.files)
         builtGraphs.add(u.graph)
         val pdir = projectDir(outDir, u.name)
-        File(pdir, "${u.name}.json").writeText(JsonOutput.write(u.graph, linkedMapOf(
-            "command" to "analyze", "project" to u.name, "nodes" to u.graph.nodes.size, "edges" to u.graph.edges.size)))
+        File(pdir, "${u.name}.json").writeText(JsonOutput.write(u.graph, linkedMapOf<String, Any?>(
+            "command" to "analyze", "project" to u.name, "nodes" to u.graph.nodes.size, "edges" to u.graph.edges.size)
+            .apply { u.monorepo?.let { put("gitRepo", it) } }))   // wallga 모노레포 마커 → manifest.repo
         val oapi = OpenApi.build(u.files, title = u.name, enrich = RestDocs.loadApi(u.snippets))
         File(pdir, "${u.name}.openapi.json").writeText(JsonOutput.writeValue(oapi))
         @Suppress("UNCHECKED_CAST")
