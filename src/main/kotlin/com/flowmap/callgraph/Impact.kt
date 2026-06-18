@@ -15,9 +15,12 @@ import java.io.File
  *   with visibility/inGraph, `changedApiMethods` seeds, `changedFiles`, `deletedNodes`,
  *   `deletedEndpoints`), lazy-loaded by the UI only when a commit is opened (graph view).
  *
- * "Changed API methods" = changed methods whose visibility is not `private` (public /
- * protected / internal / package-private) — every method another class could call, the
- * real blast surface, and the reverse-walk seeds. Private methods are excluded.
+ * "Changed API methods" = the non-private blast surface of a PR: every directly-changed
+ * method that another class could call (public / protected / internal / package-private),
+ * PLUS the nearest non-private caller(s) of each directly-changed PRIVATE method (a private
+ * change propagates UP to the public method that calls it). This set is the reverse-walk
+ * seed for impacted endpoints — so editing only private helpers still surfaces the public
+ * callers and the endpoints they reach.
  *
  * Join model: a method is "changed" in a PR when the merge commit's changed line ranges
  * fall inside the method's range *at that revision* ([PsiSourceParser] on the blob,
@@ -72,13 +75,20 @@ object Impact {
                 for (ch in changes) {
                     // Kotlin AND Java sources are mapped to method node ids; other files are skipped.
                     if (!ch.path.endsWith(".kt") && !ch.path.endsWith(".java")) continue
-                    val newFns = if (ch.changeType == "DELETE") emptyList()
-                    else GitLog.fileAt(repo, sha, ch.path)?.let { parser.functions(ch.path, it) } ?: emptyList()
+                    val newText = if (ch.changeType == "DELETE") null else GitLog.fileAt(repo, sha, ch.path)
+                    val newFns = newText?.let { parser.functions(ch.path, it) } ?: emptyList()
 
-                    // changed methods: hunks ∩ new-revision method ranges
-                    if (ch.changeType != "DELETE" && ch.newRanges.isNotEmpty()) {
-                        for (fn in newFns) if (ch.newRanges.any { it.first <= fn.endLine && fn.startLine <= it.last }) {
-                            changedFns.putIfAbsent(fn.nodeId, fn)
+                    // changed methods: CODE hunks ∩ new-revision method ranges. Comment-only / blank
+                    // line changes are ignored — a changed line counts only if it carries code
+                    // (not inside //, /* */, or /** */ — see PsiSourceParser.codeLines).
+                    if (ch.changeType != "DELETE" && ch.newRanges.isNotEmpty() && newText != null) {
+                        val codeLines = parser.codeLines(ch.path, newText)
+                        val changedCode = ch.newRanges.asSequence()
+                            .flatMap { (it.first..it.last).asSequence() }.filter { it in codeLines }.toSet()
+                        if (changedCode.isNotEmpty()) {
+                            for (fn in newFns) if (changedCode.any { it in fn.startLine..fn.endLine }) {
+                                changedFns.putIfAbsent(fn.nodeId, fn)
+                            }
                         }
                     }
 
@@ -108,8 +118,17 @@ object Impact {
                         "id" to fn.nodeId, "inGraph" to (fn.nodeId in nodeById), "visibility" to visOf(fn),
                     )
                 }
-                val changedApi = changedFns.values.filter { visOf(it) != "private" }.map { it.nodeId }
-                // impacted endpoints: reverse-walk callers from the in-graph non-private seeds.
+                // Changed API surface: directly-changed non-private methods, PLUS — for each changed
+                // PRIVATE method — the nearest non-private caller(s) reached by walking UP the call
+                // graph. A private method can't be called across classes, but changing it changes the
+                // behavior of the public method(s) that call it, so those callers are the real changed
+                // API surface (and the reverse-walk seeds). Without lifting, a PR editing only private
+                // helpers would surface no changed-API method and no impacted endpoint.
+                val directApi = changedFns.values.filter { visOf(it) != "private" }.map { it.nodeId }
+                val privateChanged = changedFns.values.filter { visOf(it) == "private" }
+                    .map { it.nodeId }.filter { it in nodeById }
+                val changedApi = (directApi + liftToApi(privateChanged, callers, nodeById)).distinct()
+                // impacted endpoints: reverse-walk callers from the in-graph API seeds.
                 val seeds = changedApi.filter { it in nodeById }
                 val impacted = impactedControllers(seeds, callers, nodeById)
                 impacted.forEach { allImpacted.add(it.id) }
@@ -161,6 +180,29 @@ object Impact {
             "deletedEndpoints" to deletedEndpoints,
         )
         return Result(index, shards)
+    }
+
+    /**
+     * Lift each changed PRIVATE method to the nearest NON-PRIVATE method(s) that (transitively)
+     * call it: walk UP the [callers] graph, stopping at the first non-private node on each branch
+     * (and continuing through private callers). These public callers are the changed API surface a
+     * private-only change actually affects. Cycle-safe via the visited set.
+     */
+    private fun liftToApi(
+        privateSeeds: List<String>, callers: Map<String, List<String>>, nodeById: Map<String, MethodNode>,
+    ): List<String> {
+        val out = LinkedHashSet<String>()
+        val seen = HashSet(privateSeeds)
+        val stack = ArrayDeque(privateSeeds)
+        while (stack.isNotEmpty()) {
+            val cur = stack.removeLast()
+            for (src in callers[cur].orEmpty()) {
+                if (!seen.add(src)) continue
+                val n = nodeById[src] ?: continue
+                if (n.visibility != "private") out.add(src) else stack.addLast(src)
+            }
+        }
+        return out.toList()
     }
 
     /** Reverse-walk callers from [seeds]; collect the CONTROLLER endpoints reached (seed included). */

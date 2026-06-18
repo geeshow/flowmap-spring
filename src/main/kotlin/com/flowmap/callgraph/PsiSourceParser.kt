@@ -8,12 +8,17 @@ import org.jetbrains.kotlin.com.intellij.lang.java.JavaLanguage
 import org.jetbrains.kotlin.com.intellij.openapi.util.Disposer
 import org.jetbrains.kotlin.com.intellij.psi.PsiAnnotation
 import org.jetbrains.kotlin.com.intellij.psi.PsiClass
+import org.jetbrains.kotlin.com.intellij.psi.PsiComment
+import org.jetbrains.kotlin.com.intellij.psi.PsiElement
+import org.jetbrains.kotlin.com.intellij.psi.PsiFile
 import org.jetbrains.kotlin.com.intellij.psi.PsiFileFactory
 import org.jetbrains.kotlin.com.intellij.psi.PsiJavaFile
 import org.jetbrains.kotlin.com.intellij.psi.PsiLiteralExpression
 import org.jetbrains.kotlin.com.intellij.psi.PsiMethod
 import org.jetbrains.kotlin.com.intellij.psi.PsiModifier
+import org.jetbrains.kotlin.com.intellij.psi.PsiWhiteSpace
 import org.jetbrains.kotlin.com.intellij.psi.util.PsiTreeUtil
+import org.jetbrains.kotlin.kdoc.psi.api.KDoc
 import org.jetbrains.kotlin.config.CommonConfigurationKeys
 import org.jetbrains.kotlin.config.CompilerConfiguration
 import org.jetbrains.kotlin.lexer.KtTokens
@@ -66,6 +71,48 @@ class PsiSourceParser : AutoCloseable {
     /** Declared functions (inside classes/objects) with line ranges + visibility + endpoint metadata. */
     fun functions(fileName: String, text: String): List<FnRange> =
         if (fileName.endsWith(".java")) functionsJava(fileName, text) else functionsKotlin(fileName, text)
+
+    /**
+     * 1-based line numbers that carry CODE — a line holds a non-whitespace token that is NOT
+     * inside a comment (line `//`, block `/* */`, or doc `/** */` / KDoc). Blank and
+     * comment-only lines are absent. [Impact] uses this to IGNORE comment-only diff hunks:
+     * a method counts as "changed" only when a changed line is also a code line. On parse
+     * failure it returns every line (fail-safe — nothing is excluded).
+     */
+    fun codeLines(fileName: String, text: String): Set<Int> {
+        val file = parseFile(fileName, text) ?: return (1..(text.count { it == '\n' } + 1)).toSet()
+        val li = LineIndex(text)
+        val code = HashSet<Int>()
+        for (leaf in leaves(file)) {
+            if (leaf.textLength == 0 || leaf is PsiWhiteSpace || isComment(leaf)) continue
+            val r = leaf.textRange
+            for (ln in li.lineAt(r.startOffset)..li.lineAt(r.endOffset - 1)) code.add(ln)
+        }
+        return code
+    }
+
+    private fun parseFile(fileName: String, text: String): PsiFile? = try {
+        if (fileName.endsWith(".java"))
+            javaFactory.createFileFromText(fileName.substringAfterLast('/'), JavaLanguage.INSTANCE, text)
+        else factory.createFile(if (fileName.endsWith(".kt")) fileName.substringAfterLast('/') else "Snippet.kt", text)
+    } catch (_: Throwable) { null }
+
+    /** A leaf (or any element) is comment text if it is, or sits inside, a comment / KDoc. */
+    private fun isComment(el: PsiElement): Boolean =
+        PsiTreeUtil.getParentOfType(el, PsiComment::class.java, false) != null ||
+            PsiTreeUtil.getParentOfType(el, KDoc::class.java, false) != null
+
+    /** All leaf elements (childless nodes) under [root], in document order. */
+    private fun leaves(root: PsiElement): List<PsiElement> {
+        val out = ArrayList<PsiElement>()
+        fun rec(e: PsiElement) {
+            var c: PsiElement? = e.firstChild
+            if (c == null) { out.add(e); return }
+            while (c != null) { rec(c); c = c.nextSibling }
+        }
+        rec(root)
+        return out
+    }
 
     // ---- Kotlin ----
 

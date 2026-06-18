@@ -77,4 +77,21 @@ object Wallga {
         val n = relPath.replace('\\', '/')
         return paths.any { n == it || n.startsWith("$it/") }
     }
+
+    /**
+     * The sub-project that OWNS [relPath] (repo-relative): the one whose `build.path`
+     * most specifically contains it (longest matching prefix wins, so nested paths
+     * disambiguate). Returns null when no sub-project claims it — i.e. shared/common
+     * code (a module not listed under any `build.path`), which the caller treats as
+     * its own stand-alone project so its nodes and the edges into it are never dropped.
+     */
+    fun owningProject(relPath: String, subs: List<SubProject>): SubProject? {
+        val n = relPath.replace('\\', '/')
+        var best: SubProject? = null
+        var bestLen = -1
+        for (sp in subs) for (p in sp.paths) {
+            if ((n == p || n.startsWith("$p/")) && p.length > bestLen) { best = sp; bestLen = p.length }
+        }
+        return best
+    }
 }

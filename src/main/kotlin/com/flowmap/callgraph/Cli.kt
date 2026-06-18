@@ -161,6 +161,35 @@ private fun graphFromOpts(opts: Opts): Pair<CallGraph, Int> {
 }
 
 private fun cmdAnalyze(opts: Opts) {
+    // Folder mode (granular pipeline): analyze the WHOLE --repo into per-project graphs under
+    // `<out-dir>/projects/<name>/<name>.json`, wallga-aware (a monorepo is analyzed once and
+    // split into its sub-projects + shared modules — same engine as `refresh`). Single-file
+    // `--out` mode below stays for ad-hoc, single-project analysis.
+    opts["--out-dir"]?.let { outPath ->
+        val repo = File(opts["--repo"] ?: DEFAULT_REPO)
+        val outDir = File(outPath).also { it.mkdirs() }
+        val projects = stampS2S(discoverGroups(repo).flatMap {
+            analyzeGroup(it, opts["--profile"], loadProps(opts["--props"]), opts.has("--include-other"), opts.has("--public-only"))
+        })
+        if (projects.isEmpty()) { System.err.println("analyze: no projects found under ${repo.path}"); exitProcess(2) }
+        val live = projects.mapTo(LinkedHashSet()) { it.name }
+        // prune ghost project folders + legacy FLAT per-project graphs (pre-`projects/` layout)
+        // so `combine --dir` doesn't double-count a project from both layouts.
+        File(outDir, "projects").listFiles { f -> f.isDirectory }?.forEach { d ->
+            if (d.name !in live && d.deleteRecursively()) System.err.println("  ~ pruned ghost projects/${d.name}/")
+        }
+        outDir.listFiles { f ->
+            f.isFile && f.name.endsWith(".json") && !f.name.startsWith("_") && f.name != "manifest.json"
+        }?.forEach { it.delete() }
+        for (u in projects) {
+            val pdir = projectDir(outDir, u.name)
+            File(pdir, "${u.name}.json").writeText(JsonOutput.write(u.graph, linkedMapOf<String, Any?>(
+                "command" to "analyze", "project" to u.name, "nodes" to u.graph.nodes.size, "edges" to u.graph.edges.size)
+                .apply { u.monorepo?.let { put("gitRepo", it) } }))   // wallga 모노레포 마커 → manifest.repo
+            System.err.println("  + projects/${u.name}/${u.name}.json (${u.graph.nodes.size} nodes, ${u.graph.edges.size} edges)")
+        }
+        return
+    }
     val repo = opts["--repo"] ?: DEFAULT_REPO
     val files = AnalysisSession().analyze(
         repoRoot = repo,
@@ -311,6 +340,251 @@ private fun discoverUnits(repo: File): List<RefreshUnit> {
 private fun projectDir(outDir: File, name: String): File = File(outDir, "projects/$name").also { it.mkdirs() }
 
 /**
+ * One ANALYSIS pass = one resolved IR/graph. Legacy: a top-level repo dir analyzed as a
+ * single whole-repo project. Monorepo (wallga.yml present): the whole [analyzeRoot] is
+ * analyzed ONCE — so calls into shared/common modules resolve and nothing is dropped —
+ * then the single graph is PARTITIONED by owning sub-project (plus a stand-alone project
+ * for any code under no `build.path`). [gitRoot] is shared by every project of the group.
+ */
+private class AnalysisGroup(
+    val analyzeRoot: File,                       // repoRoot passed to AnalysisSession
+    val gitRoot: File,                           // git work tree (pull / impact / pull-files)
+    val projectName: String?,                    // legacy whole-repo project name; null in monorepo mode
+    val subProjects: List<Wallga.SubProject>?,   // wallga sub-projects; null in legacy mode
+)
+
+/** One EMITTED project: its built graph + the inputs the later steps (openapi/gateway/impact) need. */
+private class ProjectUnit(
+    val name: String,
+    val gitRoot: File,
+    val graph: CallGraph,
+    val files: List<IrFile>,                     // this project's IR files (per-project OpenAPI)
+    val snippets: String?,                       // build/generated-snippets dir (REST Docs enrich), if any
+    val gatewayDirs: List<File>,                 // dirs scanned for spring.cloud.gateway.routes
+    val pathFilter: ((String) -> Boolean)?,      // restrict a PR's changed files to this project (impact); null = whole repo
+    val monorepo: String? = null,                // wallga monorepo this is a SUB-project of (root dir name); null = standalone
+)
+
+/**
+ * The analysis groups under [repo]. A repo root carrying a `wallga.yml` becomes ONE
+ * monorepo group (analyzed whole, then partitioned); otherwise each top-level dir is its
+ * own group — itself a monorepo group when IT carries a `wallga.yml`, else a legacy
+ * whole-repo project. Checks [repo] itself first (REPO IS the monorepo), then its children.
+ */
+private fun discoverGroups(repo: File): List<AnalysisGroup> {
+    Wallga.subProjects(repo).takeIf { it.isNotEmpty() }?.let { subs ->
+        System.err.println("  wallga.yml: ${repo.name} → ${subs.size} sub-projects (${subs.joinToString { it.name }})")
+        return listOf(AnalysisGroup(repo, repo, null, subs))
+    }
+    val dirs = repo.listFiles { f -> f.isDirectory && !f.name.startsWith(".") }?.sortedBy { it.name } ?: emptyList()
+    val out = ArrayList<AnalysisGroup>()
+    for (p in dirs) {
+        val subs = Wallga.subProjects(p)
+        if (subs.isNotEmpty()) {
+            System.err.println("  wallga.yml: ${p.name} → ${subs.size} sub-projects (${subs.joinToString { it.name }})")
+            out.add(AnalysisGroup(p, p, null, subs))
+        } else {
+            out.add(AnalysisGroup(repo, p, p.name, null))
+        }
+    }
+    return out
+}
+
+/** The build/generated-snippets dir under the first of [dirs] that has one, or null. */
+private fun snippetsIn(dirs: List<File>): String? =
+    dirs.map { File(it, "build/generated-snippets") }.firstOrNull { it.isDirectory }?.path
+
+/**
+ * Carve project [name]'s subgraph out of the monorepo's [full] graph: every node it owns
+ * (`project == name`) plus the shared, project-less target nodes (ext:/redis/db/...) its
+ * outgoing edges reference, and exactly those edges whose SOURCE it owns. Edges into ANOTHER
+ * sub-project stay (their target node lives in that sub-project's graph) so the manifest-merged
+ * and `_combined` views keep cross-project calls; partitioning by source makes the per-project
+ * graphs a complete, disjoint cover of the monorepo's edges (no node or edge is lost).
+ */
+private fun partition(full: CallGraph, name: String): CallGraph {
+    val nodeById = full.nodes.associateBy { it.id }
+    val ownIds = full.nodes.filter { it.project == name }.mapTo(HashSet()) { it.id }
+    val edges = full.edges.filter { it.source in ownIds }
+    val keep = HashSet(ownIds)
+    for (e in edges) nodeById[e.target]?.let { if (it.project == null) keep.add(it.id) }
+    return CallGraph(full.nodes.filter { it.id in keep }, edges)
+}
+
+/**
+ * Analyze one [group] into its emitted [ProjectUnit]s. Legacy → one project. Monorepo →
+ * analyze the whole root once (full cross-module resolution), build one graph, and split it
+ * by owning sub-project; code under no `build.path` surfaces as its own (shared) project so
+ * its nodes and the edges into it are never dropped.
+ */
+private fun analyzeGroup(
+    group: AnalysisGroup, profile: String?, props: Map<String, String>,
+    includeOther: Boolean, publicOnly: Boolean,
+): List<ProjectUnit> {
+    val subs = group.subProjects
+    if (subs == null) {
+        val name = group.projectName!!
+        val files = AnalysisSession().analyze(group.analyzeRoot.path, name, profile, props)
+        if (files.isEmpty()) return emptyList()
+        val dirs = listOf(File(group.analyzeRoot, name)).filter { it.isDirectory }
+        val snips = snippetsIn(dirs)
+        val graph = GraphBuilder(files, includeOther, RestDocs.load(snips), publicOnly = publicOnly).build()
+        return listOf(ProjectUnit(name, group.gitRoot, graph, files, snips, dirs, pathFilter = null))
+    }
+    // Monorepo: one whole-repo pass, stamped per owning sub-project (Provenance).
+    val all = AnalysisSession().analyze(group.analyzeRoot.path, null, profile, props, subProjects = subs)
+    if (all.isEmpty()) return emptyList()
+    // REST Docs for the FULL build = merge of every sub-project's snippets.
+    val descriptions = subs.flatMap { it.paths }
+        .mapNotNull { snippetsIn(listOf(File(group.analyzeRoot, it))) }.distinct()
+        .fold(emptyMap<Pair<String, String>, String>()) { acc, s -> acc + RestDocs.load(s) }
+    val full = GraphBuilder(all, includeOther, descriptions, publicOnly = publicOnly).build()
+    val subByName = subs.associateBy { it.name }
+    val filesByProject = all.groupBy { it.project }
+    // Order: declared sub-projects first, then any shared projects (stable, name-sorted).
+    val names = (subs.map { it.name } + filesByProject.keys.filterNotNull().sorted())
+        .filter { it in filesByProject.keys }.distinct()
+    return names.map { name ->
+        val files = filesByProject[name].orEmpty()
+        val sub = subByName[name]
+        val dirs = (sub?.paths ?: listOf(name)).map { File(group.analyzeRoot, it) }.filter { it.isDirectory }
+        val filter: (String) -> Boolean =
+            if (sub != null) { p -> Wallga.matches(p, sub.paths) }
+            else { p -> p.replace('\\', '/').let { it == name || it.startsWith("$name/") } }
+        ProjectUnit(name, group.gitRoot, partition(full, name), files, snippetsIn(dirs), dirs, filter,
+            monorepo = group.analyzeRoot.name)
+    }
+}
+
+/**
+ * Stamp every project's EXTERNAL nodes with their server-to-server target ([MethodNode.s2sService])
+ * by reading host info from ALL projects' application*.yml (every profile) — see [HostRegistry].
+ * A host configured for a known service in ANY environment links the call to that service; the web
+ * app then renders such external calls as s2s instead of a shared "external API" bucket. localhost
+ * 류는 제외. Tolerant: yml 부재/파싱 실패는 건너뛴다(빈 레지스트리 → 노드 힌트로만 해석).
+ */
+private fun stampS2S(projects: List<ProjectUnit>): List<ProjectUnit> {
+    val names = projects.map { it.name }
+    val normNames = names.map { it to it.lowercase().filter(Char::isLetterOrDigit) }
+    val registry = HostRegistry.build(projects.map { it.name to it.gatewayDirs }, names)
+    var stamped = 0
+    val out = projects.map { u ->
+        var changed = false
+        val newNodes = u.graph.nodes.map { n ->
+            if (n.layer != Layer.EXTERNAL) return@map n
+            val tgt = HostRegistry.resolve(n, registry, normNames, u.name)
+            if (tgt == null || tgt == u.name) n else { changed = true; stamped++; n.copy(s2sService = tgt) }
+        }
+        if (!changed) u
+        else ProjectUnit(u.name, u.gitRoot, CallGraph(newNodes, u.graph.edges), u.files, u.snippets,
+            u.gatewayDirs, u.pathFilter, u.monorepo)
+    }
+    System.err.println("  s2s(host): ${registry.size} hosts mapped, stamped $stamped external call(s) → server-to-server")
+    return out
+}
+
+/** One PR-impact target: a project [name], the git work tree to mine, and the optional
+ *  changed-file [pathFilter] that attributes a PR to it (sub-project mode). */
+private class ImpactTarget(val name: String, val gitRoot: File, val pathFilter: ((String) -> Boolean)?)
+
+/**
+ * Per-project PR analysis against the [graph] (the combined graph, so cross-service
+ * breaking-change detection sees external callers): impact index + shards + lazy-loaded
+ * per-PR file diffs, written into `<outDir>/projects/<name>/`. Targets sharing a git work
+ * tree fetch its merged-PR list ONCE (cached) and attribute each PR via their [pathFilter].
+ * Shared by `refresh` (step 5) and the granular `impact --out-dir` step.
+ */
+private fun runImpactStep(targets: List<ImpactTarget>, graph: CallGraph, outDir: File, opts: Opts) {
+    val impactMax = opts["--impact-max"]?.toIntOrNull() ?: opts["--max"]?.toIntOrNull() ?: 10
+    System.err.println("[impact] PR analysis (impact + pull-files): ${targets.size} project(s), max=$impactMax")
+    var impactCount = 0; var skipped = 0; var failed = 0
+    val pullsCache = HashMap<String, List<GitHub.Pr>?>()   // (gitRoot|branch) -> pulls (null = no source)
+    for (u in targets) {
+        val g = u.gitRoot
+        val isRoot = GitLog.isRepoRoot(g)
+        val branch = if (isRoot) GitLog.resolveBranch(g, opts["--branch"]) else null
+        val pdir = projectDir(outDir, u.name)
+        when {
+            !isRoot -> { System.err.println("  · ${u.name}: skip — not a standalone git repo"); skipped++ }
+            branch == null -> { System.err.println("  · ${u.name}: skip — no default branch (try --branch)"); skipped++ }
+            else -> {
+                val cacheKey = "${g.canonicalPath} $branch"
+                val pulls = pullsCache.getOrPut(cacheKey) {
+                    System.err.println("  → ${g.name}@$branch: fetching merged PRs (git-first, max $impactMax)…")
+                    GitHub.mergedPulls(g, branch, impactMax)
+                }
+                val impactFile = File(pdir, "${u.name}.impact.json")
+                val filter = u.pathFilter
+                when {
+                    pulls == null -> {             // no PR source: keep any prior impact, don't overwrite/delete
+                        System.err.println("  ✗ ${u.name}: no PR source for base $branch (no git PR markers + gh unavailable) — keeping existing impact")
+                        failed++
+                    }
+                    pulls.isEmpty() -> {           // gh ran, no merged PRs: drop stale impact + pull-files so they aren't served
+                        val rm = removeImpactFiles(pdir, u.name) or removePullFiles(pdir, u.name)
+                        System.err.println("  · ${u.name}: no merged PRs for base $branch — skip" + if (rm) " (removed stale artifacts)" else "")
+                        skipped++
+                    }
+                    else -> {
+                        val ok = try {
+                            System.err.println("  → ${u.name}: ${pulls.size} PRs — analyzing impact${if (filter != null) " (filtered to build.path)" else ""}…")
+                            val result = Impact.analyze(g, branch, pulls, graph, filter)
+                            impactFile.writeText(JsonOutput.writeValue(result.index))
+                            writeImpactShards(pdir, u.name, result.shards)
+                            impactCount++
+                            System.err.println("  ✓ projects/${u.name}/${u.name}.impact.json (${result.index["pullCount"]} PRs, ${result.index["changedNodeCount"]} changed nodes, ${result.index["impactedEndpointCount"]} impacted endpoints, ${result.index["breakingDeletionCount"]} breaking)")
+                            true
+                        } catch (e: Exception) {
+                            System.err.println("  ✗ ${u.name}: impact analysis FAILED — ${e.message}")
+                            failed++; false
+                        }
+                        // pull-files is best-effort: a failure here does NOT fail the project (impact already succeeded)
+                        if (ok && !opts.has("--no-pull-files")) {
+                            try {
+                                System.err.println("  → ${u.name}: collecting per-PR file diffs (status+patch)…")
+                                val (fetched, reused) = writePullFiles(pdir, u.name, g, branch, pulls, opts.has("--refetch-pull-files"), filter)
+                                System.err.println("  ✓ projects/${u.name}/${u.name}.pulls.json (${fetched + reused} PRs: $fetched fetched, $reused reused)")
+                            } catch (e: Exception) {
+                                System.err.println("  ⚠ ${u.name}: pull-files collection failed — ${e.message} (impact kept)")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    System.err.println("[impact] PR analysis done: $impactCount analyzed, $skipped skipped, $failed failed")
+}
+
+/**
+ * The PR-impact targets for [repo] (granular `impact --out-dir`), derived WITHOUT re-analysis:
+ * a wallga monorepo's sub-projects (attributed by `build.path`) plus any shared-module project
+ * already emitted into `<outDir>/projects/<name>/` (attributed by its top-level dir); a legacy
+ * repo dir is one whole-repo target. Only projects with an emitted graph are included.
+ */
+private fun impactTargets(repo: File, outDir: File): List<ImpactTarget> {
+    val emitted = { name: String -> File(outDir, "projects/$name/$name.json").isFile }
+    val out = ArrayList<ImpactTarget>()
+    for (group in discoverGroups(repo)) {
+        val subs = group.subProjects
+        if (subs == null) {
+            val name = group.projectName!!
+            if (emitted(name)) out.add(ImpactTarget(name, group.gitRoot, null))
+            continue
+        }
+        val subNames = subs.mapTo(HashSet()) { it.name }
+        for (sub in subs) if (emitted(sub.name)) out.add(ImpactTarget(sub.name, group.gitRoot) { p -> Wallga.matches(p, sub.paths) })
+        // shared modules: emitted projects under this monorepo's root that no build.path claims
+        File(outDir, "projects").listFiles { f -> f.isDirectory }?.sortedBy { it.name }?.forEach { d ->
+            val name = d.name
+            if (name in subNames || !emitted(name) || !File(group.analyzeRoot, name).isDirectory) return@forEach
+            out.add(ImpactTarget(name, group.gitRoot) { p -> p.replace('\\', '/').let { it == name || it.startsWith("$name/") } })
+        }
+    }
+    return out
+}
+
+/**
  * Write a gateway project's route table to `<projectDir>/<name>.gateway.json`. The web app
  * loads this to resolve front→backend joins through the gateway: a front call to a route's
  * `publicPrefix` is rewritten by `backendPrefix` and matched against the backend endpoint —
@@ -336,13 +610,13 @@ private fun cmdRefresh(opts: Opts) {
     val props = loadProps(opts["--props"])
     val includeOther = opts.has("--include-other")
     val publicOnly = opts.has("--public-only")
-    val units = discoverUnits(repo)
-    if (units.isEmpty()) { System.err.println("refresh: no projects found under ${repo.path}"); exitProcess(2) }
+    val groups = discoverGroups(repo)
+    if (groups.isEmpty()) { System.err.println("refresh: no projects found under ${repo.path}"); exitProcess(2) }
 
     // 1) pull each DISTINCT git work tree's checked-out branch (fast-forward only).
     //    Sub-projects of one monorepo share a git root — pull it once.
     if (!opts.has("--no-pull")) {
-        for (g in units.map { it.gitRoot }.distinctBy { it.canonicalPath }) {
+        for (g in groups.map { it.gitRoot }.distinctBy { it.canonicalPath }) {
             if (!GitLog.isRepoRoot(g)) { System.err.println("  - ${g.name}: (not a standalone git repo, skip pull)"); continue }
             val branch = GitLog.currentBranch(g)
             val (ok, msg) = GitLog.pull(g)
@@ -351,30 +625,26 @@ private fun cmdRefresh(opts: Opts) {
         }
     }
 
-    // 2) analyze each unit once; reuse the IR for both graph and OpenAPI. Output is split
-    //    per project into `<outDir>/projects/<name>/` (graph + openapi siblings).
+    // 2) analyze each group, then emit per project into `<outDir>/projects/<name>/` (graph +
+    //    openapi siblings). A wallga monorepo is analyzed ONCE and split into its sub-projects
+    //    (plus a stand-alone project per shared module) — see [analyzeGroup]/[partition].
+    val projects = stampS2S(groups.flatMap { analyzeGroup(it, profile, props, includeOther, publicOnly) })
     val builtGraphs = ArrayList<CallGraph>()
     val allFiles = ArrayList<IrFile>()
     val liveBases = LinkedHashSet<String>()
-    for (u in units) {
-        val files = AnalysisSession().analyze(
-            u.analyzeRoot.path, u.projectFilter, profile, props,
-            sourcePaths = u.sourcePaths, projectName = if (u.isSubProject) u.name else null,
-        )
-        if (files.isEmpty()) continue // no kt/java sources (e.g. a frontend dir) — no ghost output
+    for (u in projects) {
         liveBases.add(u.name)
-        allFiles.addAll(files)
-        val snippets = u.snippets()
-        val graph = GraphBuilder(files, includeOther, RestDocs.load(snippets), publicOnly = publicOnly).build()
-        builtGraphs.add(graph)
+        allFiles.addAll(u.files)
+        builtGraphs.add(u.graph)
         val pdir = projectDir(outDir, u.name)
-        File(pdir, "${u.name}.json").writeText(JsonOutput.write(graph, linkedMapOf(
-            "command" to "analyze", "project" to u.name, "nodes" to graph.nodes.size, "edges" to graph.edges.size)))
-        val oapi = OpenApi.build(files, title = u.name, enrich = RestDocs.loadApi(snippets))
+        File(pdir, "${u.name}.json").writeText(JsonOutput.write(u.graph, linkedMapOf<String, Any?>(
+            "command" to "analyze", "project" to u.name, "nodes" to u.graph.nodes.size, "edges" to u.graph.edges.size)
+            .apply { u.monorepo?.let { put("gitRepo", it) } }))   // wallga 모노레포 마커 → manifest.repo
+        val oapi = OpenApi.build(u.files, title = u.name, enrich = RestDocs.loadApi(u.snippets))
         File(pdir, "${u.name}.openapi.json").writeText(JsonOutput.writeValue(oapi))
         @Suppress("UNCHECKED_CAST")
         val pPaths = (oapi["paths"] as? Map<String, *>)?.size ?: 0
-        System.err.println("  + projects/${u.name}/${u.name}.json (${graph.nodes.size} nodes, ${graph.edges.size} edges)")
+        System.err.println("  + projects/${u.name}/${u.name}.json (${u.graph.nodes.size} nodes, ${u.graph.edges.size} edges)")
         System.err.println("  + projects/${u.name}/${u.name}.openapi.json ($pPaths paths)")
     }
 
@@ -402,9 +672,9 @@ private fun cmdRefresh(opts: Opts) {
         if (r.isNotEmpty()) { gateways.add(Gateway.Source(name, r)); seenGw.add(name)
             System.err.println("  gateway: ${r.size} routes from $path (as '$name')") }
     }
-    for (u in units) {
-        if (u.name in seenGw || u.name !in liveBases) continue
-        val r = u.gatewayDirs().flatMap { Gateway.discover(it) }
+    for (u in projects) {
+        if (u.name in seenGw) continue
+        val r = u.gatewayDirs.flatMap { Gateway.discover(it) }
         if (r.isNotEmpty()) { gateways.add(Gateway.Source(u.name, r)); seenGw.add(u.name)
             System.err.println("  gateway: discovered ${r.size} routes in ${u.name}") }
     }
@@ -433,71 +703,10 @@ private fun cmdRefresh(opts: Opts) {
     // detection sees external callers): impact + lazy-loaded per-PR file diffs, written into
     // `projects/<name>/`. Sub-projects of one monorepo share the repo's merged-PR list (fetched
     // once, cached) and ATTRIBUTE each PR by filtering its changed files to their build.path.
-    var impactCount = 0
     if (opts.has("--no-impact")) {
         System.err.println("[5/7] PR analysis: skipped (--no-impact)")
     } else {
-        val impactMax = opts["--impact-max"]?.toIntOrNull() ?: 10
-        val candidates = units.count { it.name in liveBases }
-        System.err.println("[5/7] PR analysis (impact + pull-files): $candidates/${units.size} project(s) with backend sources, max=$impactMax")
-        var skipped = 0; var failed = 0
-        val pullsCache = HashMap<String, List<GitHub.Pr>?>()   // (gitRoot|branch) -> pulls (null = no source)
-        for (u in units) {
-            if (u.name !in liveBases) continue        // non-backend unit — already reported in step 2
-            val g = u.gitRoot
-            val isRoot = GitLog.isRepoRoot(g)
-            val branch = if (isRoot) GitLog.resolveBranch(g, opts["--branch"]) else null
-            val pdir = projectDir(outDir, u.name)
-            when {
-                !isRoot -> { System.err.println("  · ${u.name}: skip — not a standalone git repo"); skipped++ }
-                branch == null -> { System.err.println("  · ${u.name}: skip — no default branch (try --branch)"); skipped++ }
-                else -> {
-                    val cacheKey = "${g.canonicalPath} $branch"
-                    val pulls = pullsCache.getOrPut(cacheKey) {
-                        System.err.println("  → ${g.name}@$branch: fetching merged PRs (git-first, max $impactMax)…")
-                        GitHub.mergedPulls(g, branch, impactMax)
-                    }
-                    val impactFile = File(pdir, "${u.name}.impact.json")
-                    val filter = u.pathFilter()
-                    when {
-                        pulls == null -> {             // no PR source: keep any prior impact, don't overwrite/delete
-                            System.err.println("  ✗ ${u.name}: no PR source for base $branch (no git PR markers + gh unavailable) — keeping existing impact")
-                            failed++
-                        }
-                        pulls.isEmpty() -> {           // gh ran, no merged PRs: drop stale impact + pull-files so they aren't served
-                            val rm = removeImpactFiles(pdir, u.name) or removePullFiles(pdir, u.name)
-                            System.err.println("  · ${u.name}: no merged PRs for base $branch — skip" + if (rm) " (removed stale artifacts)" else "")
-                            skipped++
-                        }
-                        else -> {
-                            val ok = try {
-                                System.err.println("  → ${u.name}: ${pulls.size} PRs — analyzing impact${if (filter != null) " (filtered to build.path)" else ""}…")
-                                val result = Impact.analyze(g, branch, pulls, combined, filter)
-                                impactFile.writeText(JsonOutput.writeValue(result.index))
-                                writeImpactShards(pdir, u.name, result.shards)
-                                impactCount++
-                                System.err.println("  ✓ projects/${u.name}/${u.name}.impact.json (${result.index["pullCount"]} PRs, ${result.index["changedNodeCount"]} changed nodes, ${result.index["impactedEndpointCount"]} impacted endpoints, ${result.index["breakingDeletionCount"]} breaking)")
-                                true
-                            } catch (e: Exception) {
-                                System.err.println("  ✗ ${u.name}: impact analysis FAILED — ${e.message}")
-                                failed++; false
-                            }
-                            // pull-files is best-effort: a failure here does NOT fail the project (impact already succeeded)
-                            if (ok && !opts.has("--no-pull-files")) {
-                                try {
-                                    System.err.println("  → ${u.name}: collecting per-PR file diffs (status+patch)…")
-                                    val (fetched, reused) = writePullFiles(pdir, u.name, g, branch, pulls, opts.has("--refetch-pull-files"), filter)
-                                    System.err.println("  ✓ projects/${u.name}/${u.name}.pulls.json (${fetched + reused} PRs: $fetched fetched, $reused reused)")
-                                } catch (e: Exception) {
-                                    System.err.println("  ⚠ ${u.name}: pull-files collection failed — ${e.message} (impact kept)")
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        System.err.println("[5/7] PR analysis done: $impactCount analyzed, $skipped skipped, $failed failed")
+        runImpactStep(projects.map { ImpactTarget(it.name, it.gitRoot, it.pathFilter) }, combined, outDir, opts)
     }
 
     // 6) lightweight manifest (additive — leaves _combined.json and friends intact)
@@ -518,10 +727,35 @@ private fun cmdRefresh(opts: Opts) {
         System.err.println("  sync: ${r.copied} files copied, manifest.json with ${r.projects} projects -> ${dest.path}")
     }
 
-    System.err.println("refresh done: ${liveBases.size} projects, combined ${combined.nodes.size} nodes / $s2s s2s, openapi $paths paths, impact $impactCount, manifest $manifestCount projects -> ${outDir.path}")
+    System.err.println("refresh done: ${liveBases.size} projects, combined ${combined.nodes.size} nodes / $s2s s2s, openapi $paths paths, manifest $manifestCount projects -> ${outDir.path}")
 }
 
 private fun cmdOpenApi(opts: Opts) {
+    // Folder mode (granular pipeline): per-project OpenAPI under `<out-dir>/projects/<name>/`,
+    // plus a repo-wide `<out-dir>/_openapi.json`. Wallga-aware (same split as analyze/refresh).
+    opts["--out-dir"]?.let { outPath ->
+        val repo = File(opts["--repo"] ?: DEFAULT_REPO)
+        val outDir = File(outPath).also { it.mkdirs() }
+        val version = opts["--api-version"] ?: "1.0.0"
+        val projects = discoverGroups(repo).flatMap {
+            analyzeGroup(it, opts["--profile"], loadProps(opts["--props"]), opts.has("--include-other"), opts.has("--public-only"))
+        }
+        val allFiles = ArrayList<IrFile>()
+        for (u in projects) {
+            allFiles.addAll(u.files)
+            val doc = OpenApi.build(u.files, title = u.name, version = version, enrich = RestDocs.loadApi(u.snippets))
+            File(projectDir(outDir, u.name), "${u.name}.openapi.json").writeText(JsonOutput.writeValue(doc))
+            @Suppress("UNCHECKED_CAST")
+            val pc = (doc["paths"] as? Map<String, *>)?.size ?: 0
+            System.err.println("  + projects/${u.name}/${u.name}.openapi.json ($pc paths)")
+        }
+        val allDoc = OpenApi.build(allFiles, title = opts["--title"] ?: "flowmap-all", version = version)
+        File(outDir, "_openapi.json").writeText(JsonOutput.writeValue(allDoc))
+        @Suppress("UNCHECKED_CAST")
+        val paths = (allDoc["paths"] as? Map<String, *>)?.size ?: 0
+        System.err.println("  + _openapi.json ($paths paths)")
+        return
+    }
     val repo = opts["--repo"] ?: DEFAULT_REPO
     val files = AnalysisSession().analyze(
         repoRoot = repo,
@@ -551,6 +785,21 @@ private fun cmdOpenApi(opts: Opts) {
 }
 
 private fun cmdImpact(opts: Opts) {
+    // Folder mode (granular pipeline): per-project PR impact for the WHOLE --repo against the
+    // combined --graph, written into `<out-dir>/projects/<name>/`. Wallga-aware — a monorepo's
+    // sub-projects (+ shared modules) each get their own impact, attributed by build.path.
+    opts["--out-dir"]?.let { outPath ->
+        val repo = File(opts["--repo"] ?: DEFAULT_REPO)
+        val outDir = File(outPath)
+        val graphPath = opts["--graph"] ?: run {
+            System.err.println("impact --out-dir: --graph <combined.json> required"); exitProcess(2)
+        }
+        val graph = JsonOutput.read(File(graphPath).readText())
+        val targets = impactTargets(repo, outDir)
+        if (targets.isEmpty()) { System.err.println("impact: no emitted projects under ${outDir.path}/projects (run analyze first)"); exitProcess(2) }
+        runImpactStep(targets, graph, outDir, opts)
+        return
+    }
     // git repo to mine: explicit --git, else <--repo>/<--project>, else --repo
     val git = opts["--git"]?.let { File(it) }
         ?: opts["--project"]?.let { File(opts["--repo"] ?: DEFAULT_REPO, it) }
@@ -630,14 +879,34 @@ private fun cmdCombine(opts: Opts) {
         }
     }
     val graphs = usable.map { JsonOutput.read(File(it).readText()) }
-    // combine works on prebuilt graph JSONs (no source tree) → no auto-discovery here;
-    // pass an explicit --gateway-routes to add a gateway. refresh auto-discovers.
+    // Output dir: parent of --out if given, else the scanned --dir, else cwd. Per-project
+    // artifacts (and the manifest) live here.
+    val manifestDir = opts["--out"]?.let { File(it).absoluteFile.parentFile }
+        ?: opts["--dir"]?.let { File(it) }
+        ?: File(".")
     val gateways = ArrayList<Gateway.Source>()
     opts["--gateway-routes"]?.let { path ->
         val name = opts["--gateway-name"] ?: File(path).nameWithoutExtension
         val r = Gateway.load(path, name)
         System.err.println("gateway: loaded ${r.size} routes from $path (as '$name')")
         if (r.isNotEmpty()) gateways.add(Gateway.Source(name, r))
+    }
+    // With --repo, AUTO-DISCOVER gateways from the source tree (like refresh) so the granular
+    // analyze→merge pipeline also wires `gateway` edges AND emits each gateway project's route
+    // table (<name>.gateway.json) for the web front→backend join. (combine on prebuilt graphs
+    // alone has no source tree, so this is opt-in via --repo.)
+    opts["--repo"]?.let { repoPath ->
+        val repo = File(repoPath)
+        for (u in discoverUnits(repo)) {
+            val routes = u.gatewayDirs().flatMap { Gateway.discover(it) }
+            if (routes.isEmpty()) continue
+            gateways.add(Gateway.Source(u.name, routes))
+            // write next to the project's existing graph: folder layout if present, else flat.
+            val folder = File(manifestDir, "projects/${u.name}")
+            val dest = (if (folder.isDirectory) folder else manifestDir).also { it.mkdirs() }
+            writeGatewayRoutes(dest, u.name, routes)
+            System.err.println("gateway: discovered ${routes.size} routes in ${u.name} -> ${dest.name}/${u.name}.gateway.json")
+        }
     }
     val result = CrossRun.combine(graphs, gateways)
     val s2s = result.edges.count { it.kind == EdgeKind.S2S }
@@ -651,11 +920,7 @@ private fun cmdCombine(opts: Opts) {
     dump(result, opts["--out"], meta)
     System.err.println("combined ${usable.size} graphs: ${result.nodes.size} nodes, ${result.edges.size} edges, $s2s s2s, $gw gateway")
 
-    // Lightweight manifest (additive). Target the output directory: parent of
-    // --out if given, else the scanned --dir, else the cwd.
-    val manifestDir = opts["--out"]?.let { File(it).absoluteFile.parentFile }
-        ?: opts["--dir"]?.let { File(it) }
-        ?: File(".")
+    // Lightweight manifest (additive), written into the same output dir computed above.
     if (manifestDir.isDirectory) {
         val n = Manifest.write(manifestDir)
         System.err.println("manifest: ${manifestDir.path}/_manifest.json ($n projects)")
@@ -669,13 +934,21 @@ private fun collectGraphPaths(opts: Opts): List<String> {
     opts["--dir"]?.let { dir ->
         // Only ingest call-graph JSONs: skip "_*.json" (prior combine output like
         // _combined.json) and sibling artifacts that share the dir but aren't graphs
-        // (*.openapi.json, *.impact.json). A defensive non-graph check in cmdCombine
-        // also drops anything that slips through.
-        File(dir).listFiles { f ->
+        // (*.openapi.json, *.impact.json, ...). A defensive non-graph check in cmdCombine
+        // also drops anything that slips through. Scans BOTH the flat layout (`<dir>/<name>.json`)
+        // and the folder layout (`<dir>/projects/<name>/<name>.json` — what refresh and the
+        // wallga split emit), so the granular `combine --dir` sees per-sub-project graphs too.
+        val isGraph = { f: File ->
             f.isFile && f.name.endsWith(".json") && !f.name.startsWith("_") && f.name != "manifest.json" &&
                 !f.name.endsWith(".openapi.json") && !f.name.endsWith(".impact.json") &&
-                !f.name.endsWith(".pulls.json") && !f.name.endsWith(".gateway.json")
-        }?.sortedBy { it.name }?.forEach { out.add(it.path) }
+                !f.name.endsWith(".pulls.json") && !f.name.endsWith(".gateway.json") &&
+                !f.name.endsWith(".join.json") && !f.name.endsWith(".screens.json")
+        }
+        val d = File(dir)
+        d.listFiles(isGraph)?.sortedBy { it.name }?.forEach { out.add(it.path) }
+        File(d, "projects").listFiles { f -> f.isDirectory }?.sortedBy { it.name }?.forEach { pd ->
+            pd.listFiles(isGraph)?.sortedBy { it.name }?.forEach { out.add(it.path) }
+        }
     }
     return out.toList()
 }
@@ -749,13 +1022,22 @@ private fun usage() {
                     [--sync-dir <web data dir>] [--frontend-dir d1,d2] # copy per-project artifacts + manifest.json there
                     # --public-only: keep only public methods, contracting public->private->public to public->public
 
+          --- granular pipeline steps (per-project folder layout; wallga-aware, same engine as refresh) ---
+          # --out-dir splits the WHOLE --repo into projects/<name>/<name>.* (a wallga.yml monorepo →
+          # its sub-projects + a stand-alone project per shared module); without it, the single-project
+          # --out / --project forms below stay for ad-hoc debugging.
+          analyze --repo <dir> --out-dir <dir>   [--include-other] [--public-only] [--profile p] [--props kv.txt]
+          openapi --repo <dir> --out-dir <dir>   [--title T] [--api-version V] [--profile p] [--props kv.txt]
+          impact  --repo <dir> --out-dir <dir> --graph _combined.json  [--branch b] [--max N (default 10)] [--no-pull-files] [--refetch-pull-files]
+
           --- single-analysis tools (debugging / ad-hoc) ---
           analyze --repo <dir> [--project P] [--out f.json] [--include-other] [--public-only] [--profile p] [--props kv.txt] [--restdocs dir]
           openapi --repo <dir> [--project P] [--out f.json] [--restdocs dir] [--title T] [--api-version V] [--profile p] [--props kv.txt]
           impact  --git <repo> (--graph g.json | --repo <dir> --project P) [--branch b] [--max N (default 10)] [--out f.json] [--pull-files <dir>] [--refetch-pull-files]
                   # change-impact per merged PR (git-first: `git log --first-parent`; falls back to `gh` only if git finds no PR markers)
                   # --pull-files <dir>: also write a <project>.pulls.json index + <project>.pulls/<number>.json shards (lazy-load, incremental)
-          combine --graphs a.json,b.json,... | --dir <dir of *.json> [--gateway-routes routes.yml] [--gateway-name N] [--out f.json]
+          combine --graphs a.json,b.json,... | --dir <dir of *.json> [--repo <dir>] [--gateway-routes routes.yml] [--gateway-name N] [--out f.json]
+                  # --repo: auto-discover gateway routes from the source tree → wire gateway edges + emit <name>.gateway.json
           sync    --out-dir <analyzer out> --sync-dir <web data dir> [--frontend-dir d1,d2]
                   # assemble the web data dir from existing artifacts (refresh's step 7, standalone) — run AFTER the frontend analyzer
           search  --method M [--graph g.json | --repo <dir>] [--direction both|callers|callees] [--depth N] [--out f]
