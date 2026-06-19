@@ -907,11 +907,14 @@ private fun cmdCombine(opts: Opts) {
             val routes = u.gatewayDirs().flatMap { Gateway.discover(it) }
             if (routes.isEmpty()) continue
             gateways.add(Gateway.Source(u.name, routes))
-            // write next to the project's existing graph: folder layout if present, else flat.
-            val folder = File(manifestDir, "projects/${u.name}")
-            val dest = (if (folder.isDirectory) folder else manifestDir).also { it.mkdirs() }
+            // Always write under the project FOLDER (`projects/<name>/<name>.gateway.json`),
+            // even when the gateway is a YAML-only config repo with no code graph of its own
+            // (routes externalized to a Config Server). A flat root file would be dropped by
+            // the web sync (which only carries folder-grouped projects) and left unreferenced
+            // by the manifest, so the web join could never load the route table.
+            val dest = projectDir(manifestDir, u.name)
             writeGatewayRoutes(dest, u.name, routes)
-            System.err.println("gateway: discovered ${routes.size} routes in ${u.name} -> ${dest.name}/${u.name}.gateway.json")
+            System.err.println("gateway: discovered ${routes.size} routes in ${u.name} -> projects/${u.name}/${u.name}.gateway.json")
         }
     }
     val result = CrossRun.combine(graphs, gateways)

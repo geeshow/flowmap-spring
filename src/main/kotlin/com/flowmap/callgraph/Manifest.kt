@@ -145,36 +145,45 @@ object Manifest {
     }
 
     /**
-     * Repo-level (graph-less) impact folders: a `projects/<name>/` carrying a `<name>.impact.json`
-     * but NO `<name>.json` graph. Emitted for a wallga monorepo whose PR impact is analyzed once for
-     * the whole work tree (not per sub-project), so it has no service graph of its own. Linked here
-     * (with `graph:null`) so the commit/PR views can load the repo's impact; the overview/structure
-     * views — which need a graph — skip it. Each is its own `repo` id.
+     * Repo-level (graph-less) project folders: a `projects/<name>/` carrying a sibling
+     * artifact but NO `<name>.json` graph. Two real cases:
+     *   - a wallga monorepo whose PR impact is analyzed once for the whole work tree
+     *     (not per sub-project) → has `<name>.impact.json` but no service graph; linked so
+     *     the commit/PR views can load the repo's impact;
+     *   - a YAML-only API-gateway config repo (routes externalized to a Config Server, no
+     *     Spring code) → has `<name>.gateway.json` but no graph; linked so the web
+     *     front→backend join can load the route table and resolve gateway-rewritten paths.
+     * Linked with `graph:null`; the overview/structure views — which need a graph — skip it.
+     * Each is its own `repo` id. A folder with neither impact nor gateway is not emitted.
      */
-    private fun impactOnlyEntries(dir: File): List<LinkedHashMap<String, Any?>> {
+    private fun graphlessEntries(dir: File): List<LinkedHashMap<String, Any?>> {
         val pdirs = File(dir, "projects").listFiles { f -> f.isDirectory } ?: return emptyList()
         return pdirs.sortedBy { it.name }.mapNotNull { pd ->
             val name = pd.name
             if (File(pd, "$name.json").isFile) return@mapNotNull null            // has a graph → entryFor handles it
-            val impact = File(pd, "$name.impact.json").takeIf { it.isFile } ?: return@mapNotNull null
             fun rel(n: String) = "projects/$name/$n"
             fun sibling(suffix: String) = File(pd, "$name.$suffix").takeIf { it.isFile }?.let { rel(it.name) }
+            val impact = sibling("impact.json")
+            val gateway = sibling("gateway.json")
+            if (impact == null && gateway == null) return@mapNotNull null         // nothing to link → not a project
+            val stamp = (File(pd, "$name.gateway.json").takeIf { it.isFile }
+                ?: File(pd, "$name.impact.json")).lastModified()
             linkedMapOf<String, Any?>(
                 "name" to name,
                 "type" to "backend",
                 "repo" to name,                                                  // the repo aggregate IS its own repo id
-                "graph" to null,                                                 // no service graph — commit/PR views only
+                "graph" to null,                                                 // no service graph — commit/PR + gateway-join only
                 "openapi" to sibling("openapi.json"),
-                "impact" to rel(impact.name),
+                "impact" to impact,
                 "pulls" to sibling("pulls.json"),
-                "gateway" to null,
+                "gateway" to gateway,
                 "join" to null,
                 "screens" to null,
                 "nodes" to 0,
                 "edges" to 0,
                 "entryPoints" to LinkedHashMap<String, Int>(),
                 "modules" to emptyList<Any?>(),
-                "generated" to iso(Instant.ofEpochMilli(impact.lastModified())),
+                "generated" to iso(Instant.ofEpochMilli(stamp)),
             )
         }
     }
@@ -185,7 +194,7 @@ object Manifest {
      * app-facing `manifest.json`). Returns the number of project entries written.
      */
     fun write(dir: File, fileName: String = "_manifest.json"): Int {
-        val projects = projectGraphFiles(dir).map { entryFor(dir, it) } + impactOnlyEntries(dir)
+        val projects = projectGraphFiles(dir).map { entryFor(dir, it) } + graphlessEntries(dir)
         val manifest = linkedMapOf<String, Any?>(
             "version" to 1,
             "generated" to iso(Instant.now()),
