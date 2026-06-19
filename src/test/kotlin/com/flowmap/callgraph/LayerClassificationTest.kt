@@ -40,6 +40,18 @@ class LayerClassificationTest {
         assertEquals("/api/orders", n.endpoint)        // class base + method path composed
     }
 
+    @Test fun `@Service with Armeria @Get is a CONTROLLER with the endpoint (S2S provider)`() {
+        // alien exposes endpoints via Armeria (com.linecorp.armeria.server.annotation.Get),
+        // not Spring @GetMapping. It must still be a CONTROLLER so a declarative-client
+        // (@GetExchange) S2S call can join to it instead of dangling as an external API.
+        val g = graphOf(type("com.x.KycHttpService", setOf("Service"),
+            funcs = listOf(fn("getKycCdd", setOf("Get"), "GET", "/v1/kyc/cdd"))))
+        val n = g.nodes.single { it.id == "com.x.KycHttpService#getKycCdd" }
+        assertEquals(Layer.CONTROLLER, n.layer)
+        assertEquals("GET", n.httpMethod)
+        assertEquals("/v1/kyc/cdd", n.endpoint)
+    }
+
     @Test fun `@Service without any mapping stays SERVICE`() {
         val g = graphOf(type("com.x.PlainService", setOf("Service"), funcs = listOf(fn("compute"))))
         val n = g.nodes.single { it.id == "com.x.PlainService#compute" }
