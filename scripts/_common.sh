@@ -17,8 +17,11 @@ SYNC_DIR="${SYNC_DIR:-$(cfg SYNC_DIR)}"
 FRONTEND_DIR="${FRONTEND_DIR:-$(cfg FRONTEND_DIR)}"
 
 BIN="build/install/flowmap-spring/bin/flowmap-spring"
-# build the CLI if it isn't installed yet (incremental; no-op when up to date)
-[ -x "$BIN" ] || ./gradlew -q installDist
+# (re)build the CLI. ALWAYS run installDist — Gradle is incremental, so it recompiles
+# only when sources changed and is a near-instant no-op otherwise. Guarding on
+# `[ -x "$BIN" ]` would skip the rebuild whenever an old install exists, so source
+# fixes never take effect and the pipeline keeps using stale compiled classes.
+./gradlew -q installDist
 
 # project directories under REPO (one per line; excludes hidden dirs)
 projects() { find "$REPO" -mindepth 1 -maxdepth 1 -type d ! -name '.*' | sort; }
