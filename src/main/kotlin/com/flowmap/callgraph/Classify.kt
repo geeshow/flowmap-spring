@@ -88,11 +88,24 @@ object Classify {
         "HttpExchange" to "ANY",
     )
 
-    /** Method-level @*Mapping annotations -> HTTP verb. */
+    /**
+     * Method-level HTTP server-endpoint annotations -> HTTP verb (matched by SIMPLE NAME).
+     * Covers Spring's `@*Mapping` AND Armeria's bare verb annotations
+     * (`com.linecorp.armeria.server.annotation.Get`/`Post`/...): a `@Service` that serves
+     * endpoints via Armeria is a CONTROLLER by behavior, and its routes must be endpoint
+     * providers — otherwise a server-to-server call to that route can't join to it and is
+     * left dangling as an external API. The Armeria path is the annotation value, the same
+     * shape Spring uses, so `mappingOf` extracts it identically.
+     * (NOTE simple-name match: a Micronaut `@Client` interface using `@Get` would also be
+     *  read as a server endpoint, but this monorepo's outbound clients use Spring
+     *  `@GetExchange`, which lives in EXCHANGE_VERBS — never confused with a server mapping.)
+     */
     val MAPPING_VERBS: Map<String, String> = mapOf(
         "GetMapping" to "GET", "PostMapping" to "POST", "PutMapping" to "PUT",
         "DeleteMapping" to "DELETE", "PatchMapping" to "PATCH",
         "RequestMapping" to "ANY",
+        "Get" to "GET", "Post" to "POST", "Put" to "PUT",
+        "Delete" to "DELETE", "Patch" to "PATCH",
     )
 
     /**
