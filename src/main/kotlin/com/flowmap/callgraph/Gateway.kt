@@ -107,7 +107,13 @@ object Gateway {
         val backendPrefix: String
         if (rewriteFrom != null && rewriteTo != null) {
             publicPrefix = clean(literalPrefix(rewriteFrom!!))
-            backendPrefix = clean(literalPrefix(rewriteTo!!))
+            // Filters apply in order, and a route may BOTH `RewritePath` and `PrefixPath`
+            // (the common Spring Cloud Gateway shape: `RewritePath=/pension/?(?<seg>.*),
+            // /${seg}` strips the public prefix, then `PrefixPath=/public` prepends the
+            // backend prefix → backend sees `/public/...`). Folding only the RewritePath
+            // target dropped PrefixPath, leaving backendPrefix="" so every controller of
+            // the target service got wired (instead of only the `/public/...` ones).
+            backendPrefix = clean(prefixPath + "/" + literalPrefix(rewriteTo!!))
         } else {
             publicPrefix = clean(publicFromPredicate)
             val segs = publicPrefix.split("/").filter { it.isNotEmpty() }.drop(strip)
