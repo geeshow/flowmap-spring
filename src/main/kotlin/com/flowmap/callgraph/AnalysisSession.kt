@@ -18,6 +18,7 @@ import org.jetbrains.kotlin.descriptors.ClassKind
 import org.jetbrains.kotlin.descriptors.FunctionDescriptor
 import org.jetbrains.kotlin.descriptors.PropertyDescriptor
 import org.jetbrains.kotlin.lexer.KtTokens
+import org.jetbrains.kotlin.psi.KtAnnotated
 import org.jetbrains.kotlin.psi.KtAnnotationEntry
 import org.jetbrains.kotlin.psi.KtCallExpression
 import org.jetbrains.kotlin.psi.KtClass
@@ -181,7 +182,7 @@ class AnalysisSession : Resolver {
 
         private fun buildType(cls: KtClassOrObject, kt: KtFile, relPath: String, yml: YamlPropertyResolver): IrType {
             val desc = bc.get(BindingContext.CLASS, cls)
-            val annNames = desc?.annotations?.mapNotNull { it.fqName?.shortName()?.asString() }?.toSet().orEmpty()
+            val annNames = mergedAnnNames(desc?.annotations?.mapNotNull { it.fqName?.shortName()?.asString() }, cls)
             val superNames = desc?.typeConstructor?.supertypes
                 ?.mapNotNull { it.constructor.declarationDescriptor?.name?.asString() }?.toSet().orEmpty()
             val funcs = cls.declarations.filterIsInstance<KtNamedFunction>().map { buildFunction(it, yml) }
@@ -249,8 +250,12 @@ class AnalysisSession : Resolver {
 
         private fun buildFunction(fn: KtNamedFunction, yml: YamlPropertyResolver): IrFunction {
             val desc = bc.get(BindingContext.FUNCTION, fn)
-            val annNames = desc?.annotations?.mapNotNull { it.fqName?.shortName()?.asString() }?.toSet().orEmpty()
-            val (verb, path) = desc?.let { ext.mappingOf(it) } ?: (null to null)
+            val annNames = mergedAnnNames(desc?.annotations?.mapNotNull { it.fqName?.shortName()?.asString() }, fn)
+            // Descriptor-based mapping first; fall back to PSI when it misses (an off-classpath
+            // annotation type like Armeria's @Get resolves to a null fqName, so ext.mappingOf
+            // — which keys off the resolved annotation — returns nothing).
+            val descMapping = desc?.let { ext.mappingOf(it) } ?: (null to null)
+            val (verb, path) = if (descMapping.first != null) descMapping else mappingFromPsi(fn)
             val ret = desc?.returnType?.constructor?.declarationDescriptor?.name?.asString()
             val retRef = desc?.returnType?.let { typeRefOf(it) }
             val params = desc?.valueParameters?.map { vp ->
@@ -453,6 +458,40 @@ class AnalysisSession : Resolver {
                 ?: return null
             val expr = arg.getArgumentExpression() ?: return null
             return constEval.resolveStringExpr(expr).literal
+        }
+
+        /**
+         * Annotation simple names = resolved-descriptor names UNION PSI source names. The PSI
+         * read is the load-bearing fallback for an annotation whose jar is OFF the analysis
+         * classpath (e.g. Armeria `com.linecorp.armeria.server.annotation.Get`): its descriptor
+         * `fqName` is null so the resolved set silently drops it, but the source `@Get` short
+         * name is always present. Without this, an Armeria-served `@Service` is never seen as a
+         * CONTROLLER and a server-to-server call to its route can't join (it dangles external).
+         */
+        private fun mergedAnnNames(resolved: List<String>?, psi: KtAnnotated): Set<String> {
+            val names = LinkedHashSet<String>()
+            resolved?.let { names.addAll(it) }
+            psi.annotationEntries.forEach { it.shortName?.asString()?.let(names::add) }
+            return names
+        }
+
+        /**
+         * Server-mapping (verb, path) from PSI — the fallback when descriptor-based
+         * [ExternalResolver.mappingOf] misses because the mapping annotation's type is
+         * unresolved (off-classpath, e.g. Armeria `@Get`). Verb by simple name (MAPPING_VERBS);
+         * path from the `value`/`path` arg or the first positional, with const refs folded via
+         * the binding context (`@Get(KYC_CDD_PATH)` resolves even when `@Get` itself does not).
+         */
+        private fun mappingFromPsi(fn: KtNamedFunction): Pair<String?, String?> {
+            for (entry in fn.annotationEntries) {
+                val verb = Classify.MAPPING_VERBS[entry.shortName?.asString()] ?: continue
+                val path = annNamedStringArg(entry, "value")
+                    ?: annNamedStringArg(entry, "path")
+                    ?: entry.valueArguments.firstOrNull { it.getArgumentName() == null }
+                        ?.getArgumentExpression()?.let { constEval.resolveStringExpr(it).literal }
+                return verb to path
+            }
+            return null to null
         }
     }
 
