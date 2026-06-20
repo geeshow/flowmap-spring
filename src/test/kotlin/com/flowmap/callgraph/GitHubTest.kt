@@ -39,6 +39,17 @@ class GitHubTest {
         assertTrue(GitHub.parse("[]").isEmpty())
     }
 
+    @Test fun `derives PR status from state, draft and mergedAt`() {
+        assertEquals("merged", GitHub.prStatus("merged", false, null))
+        assertEquals("merged", GitHub.prStatus("open", false, "2024-01-01T00:00:00Z"))   // mergedAt wins
+        assertEquals("draft", GitHub.prStatus("open", true, null))
+        assertEquals("open", GitHub.prStatus("open", false, null))
+        assertEquals("closed", GitHub.prStatus("closed", false, null))
+        // parse(): mergedAt 있으면 merged, state/isDraft 없으면 merged 폴백
+        assertEquals("merged", GitHub.parse("""[{"number":1,"title":"a","mergedAt":"2024-01-01T00:00:00Z"}]""")[0].status)
+        assertEquals("open", GitHub.parse("""[{"number":2,"title":"b","state":"OPEN"}]""")[0].status)
+    }
+
     @Test fun `parses pulls files json with status and patch`() {
         val json = """
             [

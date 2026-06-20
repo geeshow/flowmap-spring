@@ -136,7 +136,7 @@ object Impact {
                 // LEAN index row: list/overview data only (counts + precomputed endpoints).
                 perPullIndex.add(linkedMapOf(
                     "number" to pr.number, "title" to pr.title, "author" to pr.author,
-                    "mergedAt" to pr.mergedAt, "mergeCommit" to sha,
+                    "mergedAt" to pr.mergedAt, "mergeCommit" to sha, "status" to pr.status,
                     "changedNodeCount" to changedFns.size,
                     "changedFileCount" to changes.size,
                     "impactedEndpoints" to impacted.map { endpointRef(it) },
