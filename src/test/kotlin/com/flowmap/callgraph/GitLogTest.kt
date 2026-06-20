@@ -32,4 +32,17 @@ class GitLogTest {
         assertNull(GitLog.toWebBase("   "))
         assertNull(GitLog.toWebBase("/local/path/repo"))
     }
+
+    @Test fun `parseNamespaceRepo extracts owner and repo from common forms`() {
+        assertEquals("terafunding" to "tera-terafi", GitLog.parseNamespaceRepo("git@github.com:terafunding/tera-terafi.git"))
+        assertEquals("owner" to "repo", GitLog.parseNamespaceRepo("https://github.com/owner/repo.git"))
+        assertEquals("geeshow" to "flowmap-react", GitLog.parseNamespaceRepo("https://github.com/geeshow/flowmap-react"))
+        // gitlab-style subgroup: last two segments win (owner = nearest group)
+        assertEquals("sub" to "svc", GitLog.parseNamespaceRepo("git@gitlab.com:group/sub/svc.git"))
+    }
+
+    @Test fun `parseNamespaceRepo returns null when no owner segment`() {
+        assertNull(GitLog.parseNamespaceRepo(""))
+        assertNull(GitLog.parseNamespaceRepo("/local/path/repo"))
+    }
 }

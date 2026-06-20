@@ -16,13 +16,17 @@ import java.time.format.DateTimeFormatter
  *   "version": 1,
  *   "generated": "<ISO8601 UTC>",
  *   "projects": [
- *     { "name", "type": "backend", "graph": "<p>.json",
- *       "openapi": "<p>.openapi.json"|null, "impact": "<p>.impact.json"|null,
+ *     { "name" (=per-root), "type": "backend",
+ *       "namespace": "<git owner>"|null, "repo": "<git repo>"|null,
+ *       "graph": "projects/<ns>/<repo>/<perRoot>/<perRoot>.json",
+ *       "openapi": "…openapi.json"|null, "impact": "…impact.json"|null,
  *       "join": null, "screens": null, "nodes": N, "edges": M, "generated": "<ISO8601>" }
  *   ]
  * }
+ * Path fields are RELATIVE to the data dir (nested git namespace/repo layout); the web app
+ * fetches `data/<field>` verbatim and identifies a project by its (globally-unique) `name`.
  *
- * The project set is decided by a directory scan that mirrors the `combine`
+ * The project set is decided by a recursive directory scan that mirrors the `combine`
  * input filter: pure `<project>.json` files only (exclude `_*.json` and the
  * `.openapi.json`/`.impact.json`/`.join.json`/`.screens.json` siblings).
  */
@@ -43,15 +47,43 @@ object Manifest {
             !f.name.endsWith(".pulls.json") && !f.name.endsWith(".gateway.json") &&
             !f.name.endsWith(".join.json") && !f.name.endsWith(".screens.json")
 
+    /** Recurse [root], collecting graph JSONs at any depth (skips `.pulls`/`.impact` shard dirs). */
+    private fun graphFilesUnder(root: File): List<File> {
+        if (!root.isDirectory) return emptyList()
+        val out = ArrayList<File>()
+        fun rec(d: File) {
+            d.listFiles()?.forEach { f ->
+                when {
+                    f.isFile && isGraphFile(f) -> out.add(f)
+                    f.isDirectory && !f.name.endsWith(".pulls") && !f.name.endsWith(".impact") -> rec(f)
+                }
+            }
+        }
+        rec(root)
+        return out
+    }
+
+    /** Leaf project dirs under [root]: any dir directly containing a `.json` artifact (skips shard dirs). */
+    private fun leafProjectDirsUnder(root: File): List<File> {
+        if (!root.isDirectory) return emptyList()
+        val out = ArrayList<File>()
+        fun rec(d: File) {
+            val children = d.listFiles() ?: return
+            if (children.any { it.isFile && it.name.endsWith(".json") }) out.add(d)
+            children.forEach { if (it.isDirectory && !it.name.endsWith(".pulls") && !it.name.endsWith(".impact")) rec(it) }
+        }
+        rec(root)
+        return out
+    }
+
     /**
-     * Project graph JSONs under [dir]: both the FLAT layout (`<dir>/<name>.json`, e.g.
-     * frontend analyzers) and the per-project FOLDER layout (`<dir>/projects/<name>/<name>.json`,
-     * the backend's `wallga`/projects split). Same filter `combine --dir` uses.
+     * Project graph JSONs under [dir]: both the FLAT layout (`<dir>/<name>.json`, e.g. transitional
+     * frontend analyzers) and the nested per-project FOLDER layout
+     * (`<dir>/projects/<namespace>/<repo>/<perRoot>/<perRoot>.json`). Same filter `combine --dir` uses.
      */
     private fun projectGraphFiles(dir: File): List<File> {
         val flat = dir.listFiles { f -> isGraphFile(f) }?.toList() ?: emptyList()
-        val nested = File(dir, "projects").listFiles { f -> f.isDirectory }
-            ?.flatMap { pd -> pd.listFiles { f -> isGraphFile(f) }?.toList() ?: emptyList() } ?: emptyList()
+        val nested = graphFilesUnder(File(dir, "projects"))
         return (flat + nested).sortedBy { it.name }
     }
 
@@ -96,8 +128,9 @@ object Manifest {
         return linkedMapOf(
             "name" to projectName,
             "type" to if (isFrontend) "frontend" else "backend",
-            // git work tree this service belongs to (frontend analyzer stamps meta.gitRepo);
-            // lets repo-level views group a monorepo's sibling sub-roots. Null when absent.
+            // git work tree this service belongs to (analyzers stamp meta.gitRepo/gitNamespace);
+            // lets repo-level views group a monorepo's sibling sub-roots + deploy join on org/repo.
+            "namespace" to meta?.get("gitNamespace")?.takeIf { it.isTextual }?.asText(),
             "repo" to meta?.get("gitRepo")?.takeIf { it.isTextual }?.asText(),
             "graph" to rel(graphFile.name),
             "openapi" to sibling("openapi.json"),
@@ -145,8 +178,8 @@ object Manifest {
     }
 
     /**
-     * Repo-level (graph-less) project folders: a `projects/<name>/` carrying a sibling
-     * artifact but NO `<name>.json` graph. Two real cases:
+     * Repo-level (graph-less) project leaves: a `projects/<ns>/<repo>/<perRoot>/` carrying a
+     * sibling artifact but NO `<perRoot>.json` graph (namespace/repo derived from the path). Two real cases:
      *   - a wallga monorepo whose PR impact is analyzed once for the whole work tree
      *     (not per sub-project) → has `<name>.impact.json` but no service graph; linked so
      *     the commit/PR views can load the repo's impact;
@@ -157,11 +190,16 @@ object Manifest {
      * Each is its own `repo` id. A folder with neither impact nor gateway is not emitted.
      */
     private fun graphlessEntries(dir: File): List<LinkedHashMap<String, Any?>> {
-        val pdirs = File(dir, "projects").listFiles { f -> f.isDirectory } ?: return emptyList()
-        return pdirs.sortedBy { it.name }.mapNotNull { pd ->
+        val projectsRoot = File(dir, "projects")
+        return leafProjectDirsUnder(projectsRoot).sortedBy { it.name }.mapNotNull { pd ->
             val name = pd.name
             if (File(pd, "$name.json").isFile) return@mapNotNull null            // has a graph → entryFor handles it
-            fun rel(n: String) = "projects/$name/$n"
+            // path under projects/ is `<namespace>/<repo>/<perRoot>` in the nested layout.
+            val seg = pd.relativeTo(projectsRoot).path.replace(File.separatorChar, '/').split('/').filter { it.isNotEmpty() }
+            val namespace = if (seg.size >= 3) seg[seg.size - 3] else null
+            val repo = if (seg.size >= 2) seg[seg.size - 2] else name             // the repo aggregate IS its own repo id
+            val relLeaf = pd.relativeTo(dir).path.replace(File.separatorChar, '/')
+            fun rel(n: String) = "$relLeaf/$n"
             fun sibling(suffix: String) = File(pd, "$name.$suffix").takeIf { it.isFile }?.let { rel(it.name) }
             val impact = sibling("impact.json")
             val gateway = sibling("gateway.json")
@@ -171,7 +209,8 @@ object Manifest {
             linkedMapOf<String, Any?>(
                 "name" to name,
                 "type" to "backend",
-                "repo" to name,                                                  // the repo aggregate IS its own repo id
+                "namespace" to namespace,
+                "repo" to repo,
                 "graph" to null,                                                 // no service graph — commit/PR + gateway-join only
                 "openapi" to sibling("openapi.json"),
                 "impact" to impact,
