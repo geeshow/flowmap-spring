@@ -23,6 +23,7 @@ object GitHub {
         val author: String?,
         val mergedAt: String?,
         val mergeCommit: String?,   // merge/squash commit oid; null if unavailable
+        val status: String = "merged",   // PR 상태: merged/open/closed/draft. git-first 산출 PR은 머지 이력이라 항상 merged.
     )
 
     /**
@@ -104,7 +105,7 @@ object GitHub {
     fun ghMergedPulls(repo: File, base: String?, limit: Int): List<Pr>? {
         val args = mutableListOf(
             "pr", "list", "--state", "merged", "--limit", limit.toString(),
-            "--json", "number,title,author,mergedAt,mergeCommit",
+            "--json", "number,title,author,mergedAt,mergeCommit,state,isDraft",
         )
         if (base != null) { args.add("--base"); args.add(base) }
         val (out, code) = run(repo, args)
@@ -118,14 +119,27 @@ object GitHub {
         if (root == null || !root.isArray) return emptyList()
         return root.mapNotNull { n ->
             val number = n["number"]?.takeIf { it.isNumber }?.asInt() ?: return@mapNotNull null
+            val mergedAt = n["mergedAt"]?.asText()?.ifBlank { null }
+            val state = n["state"]?.asText()?.lowercase()?.ifBlank { null }
+            val isDraft = n["isDraft"]?.asBoolean() ?: false
             Pr(
                 number = number,
                 title = n["title"]?.asText().orEmpty(),
                 author = n["author"]?.get("login")?.asText()?.ifBlank { null },
-                mergedAt = n["mergedAt"]?.asText()?.ifBlank { null },
+                mergedAt = mergedAt,
                 mergeCommit = n["mergeCommit"]?.get("oid")?.asText()?.ifBlank { null },
+                status = prStatus(state, isDraft, mergedAt),
             )
         }
+    }
+
+    /** GitHub PR 상태 정규화: merged > draft > open/closed. (mergedAt 있으면 머지 확정) */
+    fun prStatus(state: String?, isDraft: Boolean, mergedAt: String?): String = when {
+        mergedAt != null || state == "merged" -> "merged"
+        isDraft -> "draft"
+        state == "open" -> "open"
+        state == "closed" -> "closed"
+        else -> "merged"
     }
 
     /**
@@ -231,6 +245,7 @@ object GitHub {
     fun buildShard(pr: Pr, files: List<PrFile>, webBase: String?): Map<String, Any?> = linkedMapOf(
         "command" to "pull-files", "number" to pr.number, "title" to pr.title,
         "author" to pr.author, "mergedAt" to pr.mergedAt, "mergeCommit" to pr.mergeCommit,
+        "status" to pr.status,
         "url" to webBase?.let { "$it/pull/${pr.number}" }, "repoUrl" to webBase,
         "additions" to files.sumOf { it.additions },
         "deletions" to files.sumOf { it.deletions },
@@ -251,7 +266,7 @@ object GitHub {
      */
     fun indexEntry(shard: Map<String, Any?>, shardDir: String): Map<String, Any?> = linkedMapOf(
         "number" to shard["number"], "title" to shard["title"], "author" to shard["author"],
-        "mergedAt" to shard["mergedAt"], "url" to shard["url"],
+        "mergedAt" to shard["mergedAt"], "status" to (shard["status"] ?: "merged"), "url" to shard["url"],
         "additions" to shard["additions"], "deletions" to shard["deletions"],
         "changedFiles" to shard["changedFiles"],
         "file" to "$shardDir/${shard["number"]}.json",
