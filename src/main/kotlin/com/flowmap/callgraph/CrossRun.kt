@@ -36,7 +36,8 @@ object CrossRun {
             val caller = nodes[e.source]
             val provider = ext?.let {
                 if (it.endpoint.isNullOrEmpty()) null
-                else matchProvider(providers, it.httpMethod, it.endpoint, hintTokens(it), caller?.project, caller?.module)
+                else matchProvider(providers, it.httpMethod, it.endpoint, hintTokens(it),
+                    it.s2sService, caller?.project, caller?.module)
             }
             val ne = if (provider != null) e.copy(target = provider.id, kind = EdgeKind.S2S) else e
             newEdges.putIfAbsent(ne.key(), ne)
@@ -99,11 +100,28 @@ object CrossRun {
 
     // ---- endpoint matching (verb + normalized path, project hint as tie-breaker) ----
 
+    /**
+     * Retarget an EXTERNAL call onto a CONTROLLER endpoint of another deployable unit.
+     *
+     * Path matching is two-tier so that a base-path difference (server.servlet.context-path,
+     * Feign `path=` base, gateway prefix) doesn't drop an otherwise-clear S2S hop to EXTERNAL:
+     *  - **exact** normalized-path match — always accepted (any plausible provider).
+     *  - **suffix** match — the shorter path is a clean trailing-segment suffix of the longer
+     *    (≥2 shared segments). Accepted when EITHER a service signal corroborates (the provider
+     *    lives in the yml-resolved [s2sService], or its project/module aliases a call hint) OR the
+     *    suffix match is globally unambiguous (exactly one cross-unit provider, concrete verbs) —
+     *    the latter still links a call whose host config doesn't textually name its owner. A loose
+     *    overlap with neither a signal nor uniqueness never fabricates a cross-service edge.
+     *
+     * [s2sService] is the HostRegistry-resolved target project (yml host union) — the strongest
+     * signal we have, so it both unlocks suffix matches and wins ties.
+     */
     private fun matchProvider(
         providers: List<MethodNode>,
         verb: String?,
         path: String?,
         hints: List<String>,
+        s2sService: String?,
         callerProject: String?,
         callerModule: String?,
     ): MethodNode? {
@@ -113,15 +131,60 @@ object CrossRun {
         // the caller. Across projects that means a different project; within a single
         // multi-module project (services-as-modules) it means a different module.
         val cands = providers.filter {
-            normPath(it.endpoint) == np && verbOk(it.httpMethod, verb) &&
+            verbOk(it.httpMethod, verb) &&
                 (it.project != callerProject || (callerModule != null && it.module != callerModule))
         }
         if (cands.isEmpty()) return null
-        // Prefer a provider the call's service hint points at (Feign name / url placeholder),
-        // then a cross-project provider, then the first remaining candidate.
+
+        // Tier 1: exact path match (existing behaviour).
+        cands.filter { normPath(it.endpoint) == np }.takeIf { it.isNotEmpty() }
+            ?.let { return pickByHint(it, s2sService, hints, callerProject) }
+
+        // Tier 2: suffix match (base-path/context-path/gateway-prefix tolerant).
+        val suffix = cands.mapNotNull { p ->
+            suffixDrop(np, normPath(p.endpoint))?.let { drop -> p to drop }
+        }
+        if (suffix.isEmpty()) return null
+        val bestDrop = suffix.minOf { it.second }
+        val tied = suffix.filter { it.second == bestDrop }.map { it.first }   // closest (fewest dropped) wins
+
+        // 2a: a service signal (yml host / Feign name / placeholder) corroborates the closest match.
+        val signal = tied.filter {
+            it.project == s2sService || projectMatchesHint(it.project, hints) || moduleMatchesHint(it.module, hints)
+        }
+        if (signal.isNotEmpty()) return pickByHint(signal, s2sService, hints, callerProject)
+
+        // 2b: no signal — accept only a globally UNIQUE suffix match with concrete verbs, so a
+        //     single unambiguous endpoint owner is linked even when host config doesn't name it.
+        if (verb != null && verb != "ANY" && suffix.size == 1 &&
+            suffix.single().first.httpMethod.let { it != null && it != "ANY" }
+        ) return suffix.single().first
+        return null
+    }
+
+    /** Among equally-good path matches: yml-resolved target > call hint alias > any cross-project > first. */
+    private fun pickByHint(
+        cands: List<MethodNode>, s2sService: String?, hints: List<String>, callerProject: String?,
+    ): MethodNode {
+        cands.firstOrNull { it.project == s2sService }?.let { return it }
         cands.firstOrNull { projectMatchesHint(it.project, hints) || moduleMatchesHint(it.module, hints) }?.let { return it }
         cands.firstOrNull { it.project != callerProject }?.let { return it }
         return cands.first()
+    }
+
+    /**
+     * If the shorter of two normalized paths is a clean trailing-segment suffix of the longer
+     * (sharing ≥2 segments), return how many leading segments the longer one has extra (the
+     * dropped base path) — smaller is a closer match. null when not a suffix relation. Exact
+     * equality is handled by the caller's tier-1 and never reaches here.
+     */
+    private fun suffixDrop(a: String, b: String): Int? {
+        val sa = a.split('/').filter { it.isNotEmpty() }
+        val sb = b.split('/').filter { it.isNotEmpty() }
+        val (short, long) = if (sa.size <= sb.size) sa to sb else sb to sa
+        if (short.size < 2 || short.size == long.size) return null
+        if (long.takeLast(short.size) != short) return null
+        return long.size - short.size
     }
 
     private fun moduleMatchesHint(module: String?, tokens: List<String>): Boolean {
