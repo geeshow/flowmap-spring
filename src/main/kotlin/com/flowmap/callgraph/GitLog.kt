@@ -63,6 +63,22 @@ object GitLog {
     /** Web base URL for this repo's `origin` (e.g. `https://github.com/owner/repo`), or null. */
     fun webBaseUrl(repo: File): String? = remoteUrl(repo)?.let { toWebBase(it) }
 
+    /** (namespace, repo) from this repo's `origin` remote, or null when there is no usable remote. */
+    fun namespaceRepo(repo: File): Pair<String, String>? = remoteUrl(repo)?.let { parseNamespaceRepo(it) }
+
+    /**
+     * Parse a git remote URL into its (owner/namespace, repo) pair — the last two path
+     * segments of the normalized https web base, e.g. `git@github.com:terafunding/tera-terafi.git`
+     * → `("terafunding", "tera-terafi")`. Returns null when the URL can't be normalized or has
+     * fewer than two path segments. Pure (no git invocation) so it is unit-testable.
+     */
+    fun parseNamespaceRepo(remote: String): Pair<String, String>? {
+        val web = toWebBase(remote) ?: return null               // https://host/owner/.../repo
+        val segs = web.removePrefix("https://").split('/').filter { it.isNotEmpty() }
+        if (segs.size < 3) return null                           // need host + owner + repo
+        return segs[segs.size - 2] to segs.last()
+    }
+
     /**
      * Normalize a git remote URL to its https web base (no trailing `.git`),
      * handling scp-style (`git@host:owner/repo.git`), `ssh://`, and `http(s)://`

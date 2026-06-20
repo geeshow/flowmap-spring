@@ -175,18 +175,20 @@ private fun cmdAnalyze(opts: Opts) {
         val live = projects.mapTo(LinkedHashSet()) { it.name }
         // prune ghost project folders + legacy FLAT per-project graphs (pre-`projects/` layout)
         // so `combine --dir` doesn't double-count a project from both layouts.
-        File(outDir, "projects").listFiles { f -> f.isDirectory }?.forEach { d ->
-            if (d.name !in live && d.deleteRecursively()) System.err.println("  ~ pruned ghost projects/${d.name}/")
+        leafProjectDirs(outDir).forEach { d ->
+            if (d.name !in live && d.deleteRecursively()) System.err.println("  ~ pruned ghost projects/${d.parentFile.parentFile.name}/${d.parentFile.name}/${d.name}/")
         }
+        pruneEmptyProjectParents(outDir)
         outDir.listFiles { f ->
             f.isFile && f.name.endsWith(".json") && !f.name.startsWith("_") && f.name != "manifest.json"
         }?.forEach { it.delete() }
         for (u in projects) {
-            val pdir = projectDir(outDir, u.name)
+            val prov = provenanceOf(u.gitRoot, u.name)
+            val pdir = projectDir(outDir, prov, u.name)
             File(pdir, "${u.name}.json").writeText(JsonOutput.write(u.graph, linkedMapOf<String, Any?>(
-                "command" to "analyze", "project" to u.name, "nodes" to u.graph.nodes.size, "edges" to u.graph.edges.size)
-                .apply { u.monorepo?.let { put("gitRepo", it) } }))   // wallga 모노레포 마커 → manifest.repo
-            System.err.println("  + projects/${u.name}/${u.name}.json (${u.graph.nodes.size} nodes, ${u.graph.edges.size} edges)")
+                "command" to "analyze", "project" to u.name, "nodes" to u.graph.nodes.size, "edges" to u.graph.edges.size,
+                "gitNamespace" to prov.namespace, "gitRepo" to prov.repo)))   // → manifest.namespace/repo
+            System.err.println("  + projects/${prov.namespace}/${prov.repo}/${u.name}/${u.name}.json (${u.graph.nodes.size} nodes, ${u.graph.edges.size} edges)")
         }
         return
     }
@@ -336,8 +338,53 @@ private fun discoverUnits(repo: File): List<RefreshUnit> {
     return out
 }
 
-/** Staging output dir for one project: `<outDir>/projects/<name>/` (created on demand). */
-private fun projectDir(outDir: File, name: String): File = File(outDir, "projects/$name").also { it.mkdirs() }
+/**
+ * Resolved git provenance for the output layout + manifest: the [namespace] (owner) and
+ * [repo] a project belongs to. See [provenanceOf] for how it is derived.
+ */
+private data class Provenance(val namespace: String, val repo: String)
+
+private val provenanceCache = HashMap<String, Provenance>()
+
+/**
+ * (namespace, repo) for a project's git work tree [gitRoot], used both for the nested output
+ * layout `projects/<namespace>/<repo>/<perRoot>/` and the manifest. Rules:
+ *  - [gitRoot] is its OWN git root with an `origin` remote → (owner, repoName) from the URL;
+ *  - its own git root but no remote → (work-tree basename, work-tree basename);
+ *  - NOT its own git root (a demo project bundled inside the analyzer's repo, e.g. `.repo/admin-portal`
+ *    whose toplevel is the analyzer) → ("samples", [fallbackRepo]).
+ */
+private fun provenanceOf(gitRoot: File, fallbackRepo: String): Provenance =
+    provenanceCache.getOrPut("${gitRoot.canonicalPath}|$fallbackRepo") {
+        if (!GitLog.isRepoRoot(gitRoot)) Provenance("samples", fallbackRepo)
+        else GitLog.namespaceRepo(gitRoot)?.let { (ns, repo) -> Provenance(ns, repo) }
+            ?: Provenance(gitRoot.name, gitRoot.name)
+    }
+
+/** Staging output dir for one project: `<outDir>/projects/<namespace>/<repo>/<perRoot>/` (created on demand). */
+private fun projectDir(outDir: File, prov: Provenance, perRoot: String): File =
+    File(outDir, "projects/${prov.namespace}/${prov.repo}/$perRoot").also { it.mkdirs() }
+
+/**
+ * Leaf project dirs of the nested layout: `<outDir>/projects/<namespace>/<repo>/<perRoot>/`.
+ * The per-root (deepest) dir is where a project's `<perRoot>.json` + siblings + shard dirs live.
+ */
+private fun leafProjectDirs(outDir: File): List<File> =
+    File(outDir, "projects").listFiles { f -> f.isDirectory }?.flatMap { ns ->
+        ns.listFiles { f -> f.isDirectory }?.flatMap { repo ->
+            repo.listFiles { f -> f.isDirectory }?.toList() ?: emptyList()
+        } ?: emptyList()
+    } ?: emptyList()
+
+/** Remove now-empty `<repo>/` and `<namespace>/` parent dirs left after a leaf project dir was pruned. */
+private fun pruneEmptyProjectParents(outDir: File) {
+    File(outDir, "projects").listFiles { f -> f.isDirectory }?.forEach { ns ->
+        ns.listFiles { f -> f.isDirectory }?.forEach { repo ->
+            if (repo.listFiles()?.isEmpty() == true) repo.delete()
+        }
+        if (ns.listFiles()?.isEmpty() == true) ns.delete()
+    }
+}
 
 /**
  * One ANALYSIS pass = one resolved IR/graph. Legacy: a top-level repo dir analyzed as a
@@ -503,7 +550,7 @@ private fun runImpactStep(targets: List<ImpactTarget>, graph: CallGraph, outDir:
         val g = u.gitRoot
         val isRoot = GitLog.isRepoRoot(g)
         val branch = if (isRoot) GitLog.resolveBranch(g, opts["--branch"]) else null
-        val pdir = projectDir(outDir, u.name)
+        val pdir = projectDir(outDir, provenanceOf(g, u.name), u.name)
         when {
             !isRoot -> { System.err.println("  · ${u.name}: skip — not a standalone git repo"); skipped++ }
             branch == null -> { System.err.println("  · ${u.name}: skip — no default branch (try --branch)"); skipped++ }
@@ -565,7 +612,9 @@ private fun runImpactStep(targets: List<ImpactTarget>, graph: CallGraph, outDir:
  * Only repos/projects that were actually analyzed (at least one emitted graph) are included.
  */
 private fun impactTargets(repo: File, outDir: File): List<ImpactTarget> {
-    val emitted = { name: String -> File(outDir, "projects/$name/$name.json").isFile }
+    // Per-root names with an emitted graph on disk (nested `projects/<ns>/<repo>/<perRoot>/<perRoot>.json`).
+    val emittedNames = leafProjectDirs(outDir).filter { File(it, "${it.name}.json").isFile }.mapTo(HashSet()) { it.name }
+    val emitted = { name: String -> name in emittedNames }
     val out = ArrayList<ImpactTarget>()
     for (group in discoverGroups(repo)) {
         val subs = group.subProjects
@@ -577,8 +626,7 @@ private fun impactTargets(repo: File, outDir: File): List<ImpactTarget> {
         // Monorepo → one repo-level target. Guard: the repo was analyzed iff at least one of its
         // projects (a sub-project OR a shared module under its root) has an emitted graph on disk.
         val subNames = subs.mapTo(HashSet()) { it.name }
-        val sharedEmitted = File(outDir, "projects").listFiles { f -> f.isDirectory }
-            ?.any { d -> d.name !in subNames && emitted(d.name) && File(group.analyzeRoot, d.name).isDirectory } ?: false
+        val sharedEmitted = emittedNames.any { it !in subNames && File(group.analyzeRoot, it).isDirectory }
         if (subs.any { emitted(it.name) } || sharedEmitted)
             out.add(ImpactTarget(group.analyzeRoot.name, group.gitRoot, null))
     }
@@ -633,29 +681,33 @@ private fun cmdRefresh(opts: Opts) {
     val builtGraphs = ArrayList<CallGraph>()
     val allFiles = ArrayList<IrFile>()
     val liveBases = LinkedHashSet<String>()
+    val provByName = HashMap<String, Provenance>()   // per-root name → git provenance (gateways/impact reuse)
     for (u in projects) {
         liveBases.add(u.name)
         allFiles.addAll(u.files)
         builtGraphs.add(u.graph)
-        val pdir = projectDir(outDir, u.name)
+        val prov = provenanceOf(u.gitRoot, u.name).also { provByName[u.name] = it }
+        val rel = "projects/${prov.namespace}/${prov.repo}/${u.name}"
+        val pdir = projectDir(outDir, prov, u.name)
         File(pdir, "${u.name}.json").writeText(JsonOutput.write(u.graph, linkedMapOf<String, Any?>(
-            "command" to "analyze", "project" to u.name, "nodes" to u.graph.nodes.size, "edges" to u.graph.edges.size)
-            .apply { u.monorepo?.let { put("gitRepo", it) } }))   // wallga 모노레포 마커 → manifest.repo
+            "command" to "analyze", "project" to u.name, "nodes" to u.graph.nodes.size, "edges" to u.graph.edges.size,
+            "gitNamespace" to prov.namespace, "gitRepo" to prov.repo)))   // → manifest.namespace/repo
         val oapi = OpenApi.build(u.files, title = u.name, enrich = RestDocs.loadApi(u.snippets))
         File(pdir, "${u.name}.openapi.json").writeText(JsonOutput.writeValue(oapi))
         @Suppress("UNCHECKED_CAST")
         val pPaths = (oapi["paths"] as? Map<String, *>)?.size ?: 0
-        System.err.println("  + projects/${u.name}/${u.name}.json (${u.graph.nodes.size} nodes, ${u.graph.edges.size} edges)")
-        System.err.println("  + projects/${u.name}/${u.name}.openapi.json ($pPaths paths)")
+        System.err.println("  + $rel/${u.name}.json (${u.graph.nodes.size} nodes, ${u.graph.edges.size} edges)")
+        System.err.println("  + $rel/${u.name}.openapi.json ($pPaths paths)")
     }
 
     // 3) prune ghost project folders (a `projects/<name>/` no longer produced) plus any
     //    legacy FLAT per-project artifacts left from the pre-`projects/` layout. Aggregates
     //    (`_combined.json`/`_openapi.json`/`_manifest.json`) are kept.
-    File(outDir, "projects").listFiles { f -> f.isDirectory }?.forEach { d ->
+    leafProjectDirs(outDir).forEach { d ->
         if (d.name !in liveBases && d.deleteRecursively())
-            System.err.println("  ~ pruned ghost projects/${d.name}/")
+            System.err.println("  ~ pruned ghost ${d.parentFile.parentFile.name}/${d.parentFile.name}/${d.name}/")
     }
+    pruneEmptyProjectParents(outDir)
     outDir.listFiles { f ->
         f.isFile && f.name.endsWith(".json") && !f.name.startsWith("_") && f.name != "manifest.json"
     }?.forEach { it.delete() }
@@ -683,9 +735,9 @@ private fun cmdRefresh(opts: Opts) {
     // (projects/<gw>/<gw>.gateway.json) so the web app can join front→backend through the
     // gateway's real publicPrefix→backendPrefix transform (not a strip-first-segment guess).
     for (src in gateways) {
-        if (src.name !in liveBases) continue   // only gateways that are themselves analyzed projects
-        writeGatewayRoutes(projectDir(outDir, src.name), src.name, src.routes)
-        System.err.println("  + projects/${src.name}/${src.name}.gateway.json (${src.routes.size} routes)")
+        val prov = provByName[src.name] ?: continue   // only gateways that are themselves analyzed projects
+        writeGatewayRoutes(projectDir(outDir, prov, src.name), src.name, src.routes)
+        System.err.println("  + projects/${prov.namespace}/${prov.repo}/${src.name}/${src.name}.gateway.json (${src.routes.size} routes)")
     }
     val combined = CrossRun.combine(builtGraphs, gateways)
     val s2s = combined.edges.count { it.kind == EdgeKind.S2S }
@@ -749,11 +801,12 @@ private fun cmdOpenApi(opts: Opts) {
         val allFiles = ArrayList<IrFile>()
         for (u in projects) {
             allFiles.addAll(u.files)
+            val prov = provenanceOf(u.gitRoot, u.name)
             val doc = OpenApi.build(u.files, title = u.name, version = version, enrich = RestDocs.loadApi(u.snippets))
-            File(projectDir(outDir, u.name), "${u.name}.openapi.json").writeText(JsonOutput.writeValue(doc))
+            File(projectDir(outDir, prov, u.name), "${u.name}.openapi.json").writeText(JsonOutput.writeValue(doc))
             @Suppress("UNCHECKED_CAST")
             val pc = (doc["paths"] as? Map<String, *>)?.size ?: 0
-            System.err.println("  + projects/${u.name}/${u.name}.openapi.json ($pc paths)")
+            System.err.println("  + projects/${prov.namespace}/${prov.repo}/${u.name}/${u.name}.openapi.json ($pc paths)")
         }
         val allDoc = OpenApi.build(allFiles, title = opts["--title"] ?: "flowmap-all", version = version)
         File(outDir, "_openapi.json").writeText(JsonOutput.writeValue(allDoc))
@@ -907,14 +960,15 @@ private fun cmdCombine(opts: Opts) {
             val routes = u.gatewayDirs().flatMap { Gateway.discover(it) }
             if (routes.isEmpty()) continue
             gateways.add(Gateway.Source(u.name, routes))
-            // Always write under the project FOLDER (`projects/<name>/<name>.gateway.json`),
+            // Always write under the project FOLDER (`projects/<ns>/<repo>/<name>/<name>.gateway.json`),
             // even when the gateway is a YAML-only config repo with no code graph of its own
             // (routes externalized to a Config Server). A flat root file would be dropped by
             // the web sync (which only carries folder-grouped projects) and left unreferenced
             // by the manifest, so the web join could never load the route table.
-            val dest = projectDir(manifestDir, u.name)
+            val prov = provenanceOf(u.gitRoot, u.name)
+            val dest = projectDir(manifestDir, prov, u.name)
             writeGatewayRoutes(dest, u.name, routes)
-            System.err.println("gateway: discovered ${routes.size} routes in ${u.name} -> projects/${u.name}/${u.name}.gateway.json")
+            System.err.println("gateway: discovered ${routes.size} routes in ${u.name} -> projects/${prov.namespace}/${prov.repo}/${u.name}/${u.name}.gateway.json")
         }
     }
     val result = CrossRun.combine(graphs, gateways)
@@ -955,7 +1009,7 @@ private fun collectGraphPaths(opts: Opts): List<String> {
         }
         val d = File(dir)
         d.listFiles(isGraph)?.sortedBy { it.name }?.forEach { out.add(it.path) }
-        File(d, "projects").listFiles { f -> f.isDirectory }?.sortedBy { it.name }?.forEach { pd ->
+        leafProjectDirs(d).sortedBy { it.name }.forEach { pd ->
             pd.listFiles(isGraph)?.sortedBy { it.name }?.forEach { out.add(it.path) }
         }
     }

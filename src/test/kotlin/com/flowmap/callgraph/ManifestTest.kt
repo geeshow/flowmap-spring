@@ -55,4 +55,29 @@ class ManifestTest {
         pfile("docs-only", "docs-only.openapi.json", """{"openapi":"3.0.0"}""")
         assertTrue(projects().none { it["name"] == "docs-only" })
     }
+
+    private fun nested(rel: String, file: String, body: String) =
+        File(dir, "projects/$rel").also { it.mkdirs() }.let { File(it, file).writeText(body) }
+
+    @Test
+    fun `nested layout graph carries namespace + repo from meta and relative paths`() {
+        nested("terafunding/tera-terafi/trf-gateway", "trf-gateway.json",
+            """{"meta":{"gitNamespace":"terafunding","gitRepo":"tera-terafi","nodes":4,"edges":0},"nodes":[],"edges":[]}""")
+        nested("terafunding/tera-terafi/trf-gateway", "trf-gateway.openapi.json", """{"paths":{}}""")
+        val p = projects().single { it["name"] == "trf-gateway" }
+        assertEquals("terafunding", p["namespace"])
+        assertEquals("tera-terafi", p["repo"])
+        assertEquals("projects/terafunding/tera-terafi/trf-gateway/trf-gateway.json", p["graph"])
+        assertEquals("projects/terafunding/tera-terafi/trf-gateway/trf-gateway.openapi.json", p["openapi"])
+    }
+
+    @Test
+    fun `nested graph-less repo-level impact derives namespace + repo from path`() {
+        nested("terafunding/tera-terafi/tera-terafi", "tera-terafi.impact.json", """{"pulls":[]}""")
+        val w = projects().single { it["name"] == "tera-terafi" }
+        assertNull(w["graph"])
+        assertEquals("terafunding", w["namespace"])
+        assertEquals("tera-terafi", w["repo"])
+        assertEquals("projects/terafunding/tera-terafi/tera-terafi/tera-terafi.impact.json", w["impact"])
+    }
 }

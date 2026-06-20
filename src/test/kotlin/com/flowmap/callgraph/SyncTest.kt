@@ -73,6 +73,31 @@ class SyncTest {
         assertFalse(pj(dest, "svc", "svc.impact.json").exists())     // stale sibling of present graph pruned
     }
 
+    /** A NESTED-layout project: `<dir>/projects/<ns>/<repo>/<perRoot>/<file>`. */
+    private fun nfile(dir: File, rel: String, file: String, body: String) =
+        File(dir, "projects/$rel").also { it.mkdirs() }.let { File(it, file).writeText(body) }
+
+    @Test fun `nested source is mirrored under projects with its ns repo path preserved and departed nested leaf pruned`() {
+        val src = tmp(); val dest = tmp()
+        // source: a real-repo backend + a wallga sub-project, both nested.
+        nfile(src, "terafunding/tera-cloud-gateway/tera-cloud-gateway", "tera-cloud-gateway.json",
+            """{"nodes":[{"id":"n","layer":"CONTROLLER"}],"edges":[]}""")
+        nfile(src, "terafunding/tera-terafi/trf-gateway", "trf-gateway.json",
+            """{"nodes":[{"id":"n","layer":"CONTROLLER"}],"edges":[]}""")
+        // dest pre-populated with a DEPARTED nested backend leaf (gone from source).
+        nfile(dest, "terafunding/tera-terafi/trf-gone", "trf-gone.json",
+            """{"nodes":[{"id":"n","layer":"CONTROLLER"}],"edges":[]}""")
+
+        Sync.run(listOf(src), dest)
+
+        // present nested projects mirrored with full ns/repo/perRoot path
+        assertTrue(File(dest, "projects/terafunding/tera-cloud-gateway/tera-cloud-gateway/tera-cloud-gateway.json").exists())
+        assertTrue(File(dest, "projects/terafunding/tera-terafi/trf-gateway/trf-gateway.json").exists())
+        // departed nested leaf pruned; its now-empty parent stays only if a sibling remains (trf-gateway does)
+        assertFalse(File(dest, "projects/terafunding/tera-terafi/trf-gone").exists())
+        assertTrue(File(dest, "projects/terafunding/tera-terafi").isDirectory)   // sibling trf-gateway keeps the repo dir
+    }
+
     @Test fun `legacy flat artifacts at dest root are cleaned`() {
         val src = tmp(); val dest = tmp()
         graph(src, "svc.json", "CONTROLLER")

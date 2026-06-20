@@ -70,16 +70,42 @@ object Sync {
      * (`graph.json`, bare `openapi.json`, `<base>.*`) all converge on `<base>.*` on copy.
      */
     private class ProjectArtifacts(
-        val base: String,
-        val files: List<Pair<File, String>>,      // source file -> canonical dest name
-        val shardDirs: List<Pair<File, String>>,  // source shard dir -> canonical dest name
+        val relPath: String,                       // path under dest `projects/`: <ns>/<repo>/<perRoot> (or legacy <name>)
+        val base: String,                          // leaf dir name (perRoot) — canonical `<base>.*` rename + shard naming
+        val files: List<Pair<File, String>>,       // source file -> canonical dest name
+        val shardDirs: List<Pair<File, String>>,   // source shard dir -> canonical dest name
     )
 
     // Canonical sibling suffixes (used in `<base>.<suffix>` form) the web data dir expects.
     private val SIBLING_SUFFIXES = listOf("openapi.json", "impact.json", "pulls.json", "gateway.json", "join.json", "screens.json")
 
-    /** Source subdirs whose children are per-service folders, keyed by FOLDER name (the project). */
-    private val FOLDER_GROUPS = listOf("projects", "service", "frontend")
+    /** Source subdir whose children are the nested per-service tree. All three analyzers now
+     *  stage under `projects/<ns>/<repo>/<perRoot>/` (was spring=projects, nexcore=service,
+     *  react=frontend). Only `projects` is read so stale pre-migration `service`/`frontend`
+     *  trees left on disk aren't double-ingested. */
+    private val FOLDER_GROUPS = listOf("projects")
+
+    /** Leaf project dirs under [root]: dirs directly holding artifacts (skips `.pulls`/`.impact` shard dirs). */
+    private fun leafDirsUnder(root: File): List<File> {
+        if (!root.isDirectory) return emptyList()
+        val out = ArrayList<File>()
+        fun rec(d: File) {
+            val children = d.listFiles() ?: return
+            if (children.any { isArtifact(it) || isShardDir(it) }) out.add(d)
+            children.forEach { if (it.isDirectory && !isShardDir(it)) rec(it) }
+        }
+        rec(root)
+        return out
+    }
+
+    /** Remove now-empty intermediate dirs under [root] (deepest first), leaving [root] itself. */
+    private fun pruneEmptyDirs(root: File) {
+        if (!root.isDirectory) return
+        root.listFiles { f -> f.isDirectory }?.forEach { child ->
+            pruneEmptyDirs(child)
+            if (child.listFiles()?.isEmpty() == true) child.delete()
+        }
+    }
 
     /**
      * Canonical dest name for an artifact of project [base]: the graph → `<base>.json`,
@@ -100,22 +126,40 @@ object Sync {
      *  - flat:   `<src>/<base>.json` (+ siblings + shard dirs) — transitional/legacy; name = file base.
      */
     private fun collectProjects(src: File): List<ProjectArtifacts> {
-        val acc = LinkedHashMap<String, Pair<MutableList<Pair<File, String>>, MutableList<Pair<File, String>>>>()
-        fun bucket(name: String) = acc.getOrPut(name) { mutableListOf<Pair<File, String>>() to mutableListOf() }
-        for (group in FOLDER_GROUPS) File(src, group).listFiles { f -> f.isDirectory }?.forEach { pd ->
-            val b = bucket(pd.name)
-            pd.listFiles { f -> isArtifact(f) }?.forEach { b.first.add(it to canonicalName(pd.name, it)) }
-            pd.listFiles { f -> isShardDir(f) }?.forEach { b.second.add(it to "${pd.name}.${if (it.name.endsWith(".pulls")) "pulls" else "impact"}") }
+        // key = relPath under the group dir (`<ns>/<repo>/<perRoot>`, or legacy `<name>`).
+        val acc = LinkedHashMap<String, Triple<String, MutableList<Pair<File, String>>, MutableList<Pair<File, String>>>>()
+        fun bucket(relPath: String, base: String) = acc.getOrPut(relPath) { Triple(base, mutableListOf(), mutableListOf()) }
+        // Each analyzer stages a `<group>/.../<perRoot>/` tree (depth-agnostic: legacy `<group>/<name>/`
+        // AND nested `<group>/<ns>/<repo>/<perRoot>/`). Recurse each group dir to the LEAF project dirs
+        // (those directly holding artifacts/shard dirs) and remember their path so the dest mirrors it.
+        for (group in FOLDER_GROUPS) {
+            val groupDir = File(src, group)
+            if (!groupDir.isDirectory) continue
+            fun rec(d: File) {
+                val children = d.listFiles() ?: return
+                if (children.any { isArtifact(it) || isShardDir(it) }) {
+                    val relPath = d.relativeTo(groupDir).path.replace(File.separatorChar, '/')
+                    val b = bucket(relPath, d.name)
+                    children.forEach { f ->
+                        when {
+                            isArtifact(f) -> b.second.add(f to canonicalName(d.name, f))
+                            isShardDir(f) -> b.third.add(f to "${d.name}.${if (f.name.endsWith(".pulls")) "pulls" else "impact"}")
+                        }
+                    }
+                }
+                children.forEach { if (it.isDirectory && !isShardDir(it)) rec(it) }
+            }
+            groupDir.listFiles { f -> f.isDirectory }?.forEach { rec(it) }
         }
         // Flat is a STRICT fallback: only when the source has no folder-grouped projects
         // (a not-yet-migrated analyzer). Otherwise stale pre-migration flat files at the
         // root (e.g. a leftover `graph-<svc>.json`) would surface as phantom projects.
-        if (acc.values.none { it.first.isNotEmpty() || it.second.isNotEmpty() }) {
-            src.listFiles { f -> isArtifact(f) }?.forEach { bucket(baseOf(it.name)).first.add(it to it.name) }
-            src.listFiles { f -> isShardDir(f) }?.forEach { bucket(shardBaseOf(it.name)).second.add(it to it.name) }
+        if (acc.isEmpty()) {
+            src.listFiles { f -> isArtifact(f) }?.forEach { val b = baseOf(it.name); bucket(b, b).second.add(it to it.name) }
+            src.listFiles { f -> isShardDir(f) }?.forEach { val b = shardBaseOf(it.name); bucket(b, b).third.add(it to it.name) }
         }
-        return acc.entries.filter { it.value.first.isNotEmpty() || it.value.second.isNotEmpty() }
-            .map { (b, p) -> ProjectArtifacts(b, p.first, p.second) }
+        return acc.entries.filter { it.value.second.isNotEmpty() || it.value.third.isNotEmpty() }
+            .map { (rel, t) -> ProjectArtifacts(rel, t.first, t.second, t.third) }
     }
 
     fun run(sources: List<File>, dest: File): Result {
@@ -130,11 +174,11 @@ object Sync {
             if (src.canonicalFile == destC) { System.err.println("  sync: ${src.path} is the dest (already in place)"); continue }
             val projects = collectProjects(src)
             for (pa in projects) {
-                val destPdir = File(dest, "projects/${pa.base}").also { it.mkdirs() }
+                val destPdir = File(dest, "projects/${pa.relPath}").also { it.mkdirs() }
                 val keep = HashSet<String>()
                 for ((f, destName) in pa.files) {
                     f.copyTo(File(destPdir, destName), overwrite = true); copied++; keep.add(destName)
-                    if (isGraphArtifact(f)) syncedType[pa.base] = if (Manifest.isFrontendGraph(f)) "frontend" else "backend"
+                    if (isGraphArtifact(f)) syncedType[pa.relPath] = if (Manifest.isFrontendGraph(f)) "frontend" else "backend"
                 }
                 // mirror lazy-load shard dirs (drop then copy) so stale shards don't linger.
                 for ((d, destName) in pa.shardDirs) {
@@ -159,18 +203,21 @@ object Sync {
         dest.listFiles { f -> isArtifact(f) }?.forEach { pruneArtifact(it, "pruned legacy flat") }
         dest.listFiles { f -> isShardDir(f) }?.forEach { if (it.deleteRecursively()) System.err.println("    ~ pruned legacy flat ${it.name}/") }
 
-        // (2) departed-project prune: a `projects/<base>/` folder gone from every source.
+        // (2) departed-project prune: a `projects/<ns>/<repo>/<perRoot>/` leaf gone from every source.
         // Type-scoped — only pruned when a graph of the SAME type was synced this run, so a
-        // partial (e.g. backend-only) sync never wipes the other side.
+        // partial (e.g. backend-only) sync never wipes the other side. Keyed by relPath.
+        val destProjects = File(dest, "projects")
         val syncedFrontend = syncedType.containsValue("frontend")
         val syncedBackend = syncedType.containsValue("backend")
-        File(dest, "projects").listFiles { f -> f.isDirectory }?.forEach { pd ->
-            if (pd.name in syncedType) return@forEach                     // freshly synced — keep
+        leafDirsUnder(destProjects).forEach { pd ->
+            val relPath = pd.relativeTo(destProjects).path.replace(File.separatorChar, '/')
+            if (relPath in syncedType) return@forEach                     // freshly synced — keep
             val graph = pd.listFiles { f -> isGraphArtifact(f) }?.firstOrNull() ?: return@forEach
             val frontend = Manifest.isFrontendGraph(graph)
             if (!(frontend && syncedFrontend || !frontend && syncedBackend)) return@forEach  // type not synced — leave it
-            if (pd.deleteRecursively()) System.err.println("    ~ pruned departed ${if (frontend) "frontend" else "backend"} projects/${pd.name}/")
+            if (pd.deleteRecursively()) System.err.println("    ~ pruned departed ${if (frontend) "frontend" else "backend"} projects/$relPath/")
         }
+        pruneEmptyDirs(destProjects)   // drop now-empty <ns>/<repo>/ parents left after leaf prunes
 
         val projects = Manifest.write(dest, "manifest.json")
         System.err.println("    + manifest.json ($projects projects)")
