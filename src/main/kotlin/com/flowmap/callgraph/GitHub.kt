@@ -317,6 +317,7 @@ object GitHub {
     fun indexEntry(shard: Map<String, Any?>, shardDir: String): Map<String, Any?> = linkedMapOf(
         "number" to shard["number"], "title" to shard["title"], "author" to shard["author"],
         "mergedAt" to shard["mergedAt"], "updatedAt" to shard["updatedAt"],
+        "mergeCommit" to shard["mergeCommit"],   // 배포 이미지 태그(...:<branch>-<sha>) 매칭용 커밋 SHA
         "status" to (shard["status"] ?: "merged"), "url" to shard["url"],
         "additions" to shard["additions"], "deletions" to shard["deletions"],
         "changedFiles" to shard["changedFiles"],
