@@ -305,6 +305,9 @@ flowmap-spring/          # 분석기 = 이 저장소 루트 (kotlin-compiler-emb
 ├── settings.gradle.kts
 ├── src/main/kotlin/com/flowmap/callgraph/   # 분석기 소스
 ├── MANUAL.md                   # 명령별 옵션 · 출력 스키마 · 웹 연동 상세
+├── GATEWAY.md                  # 게이트웨이(Spring Cloud Gateway) 분석
+├── docs/
+│   └── S2S-ENDPOINT-MATCHING.md  # External→컨트롤러 S2S retarget (host 해석 + suffix 매칭)
 ├── json/                       # refresh 산출물 (gitignored) — projects/<프로젝트>/ + _집계
 └── .repo/<프로젝트>/           # 분석 대상 소스 (sample-shop 등 데모 번들; 모노레포면 wallga.yml)
 ```
