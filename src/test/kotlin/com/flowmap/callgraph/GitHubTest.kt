@@ -50,6 +50,43 @@ class GitHubTest {
         assertEquals("open", GitHub.parse("""[{"number":2,"title":"b","state":"OPEN"}]""")[0].status)
     }
 
+    @Test fun `parseOpen maps headOid, status, updatedAt for open and draft PRs`() {
+        val json = """
+            [
+              {"number":42,"title":"wip","author":{"login":"alice"},"headRefOid":"abc123",
+               "createdAt":"2026-06-01T00:00:00Z","updatedAt":"2026-06-10T09:00:00Z","isDraft":false},
+              {"number":7,"title":"draft","author":{"login":"bob"},"headRefOid":"def456",
+               "createdAt":"2026-05-01T00:00:00Z","updatedAt":"2026-05-02T00:00:00Z","isDraft":true}
+            ]
+        """.trimIndent()
+        val prs = GitHub.parseOpen(json)
+        assertEquals(2, prs.size)
+        assertEquals("open", prs[0].status)
+        assertEquals("abc123", prs[0].headOid)
+        assertEquals("abc123", prs[0].analyzedCommit)   // no mergeCommit → head is analyzed revision
+        assertEquals(null, prs[0].mergedAt)
+        assertEquals("2026-06-10T09:00:00Z", prs[0].updatedAt)
+        assertTrue(prs[0].isOpen)
+        assertEquals("draft", prs[1].status)
+        assertTrue(prs[1].isOpen)
+    }
+
+    @Test fun `parseOpen falls back to createdAt and tolerates garbage`() {
+        val one = GitHub.parseOpen("""[{"number":1,"title":"t","headRefOid":"h","createdAt":"2026-01-01T00:00:00Z"}]""")
+        assertEquals("2026-01-01T00:00:00Z", one[0].updatedAt)
+        assertEquals("open", one[0].status)   // isDraft absent → open
+        assertTrue(GitHub.parseOpen("not json").isEmpty())
+        assertTrue(GitHub.parseOpen("[]").isEmpty())
+    }
+
+    @Test fun `merged Pr defaults are unchanged and not open`() {
+        val merged = GitHub.Pr(5, "fix", "carol", "2026-02-02T00:00:00Z", "mergeSha")
+        assertEquals("merged", merged.status)
+        assertEquals("mergeSha", merged.analyzedCommit)
+        assertEquals(null, merged.headOid)
+        assertTrue(!merged.isOpen)
+    }
+
     @Test fun `parses pulls files json with status and patch`() {
         val json = """
             [

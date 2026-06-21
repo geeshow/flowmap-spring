@@ -223,6 +223,20 @@ private fun cmdAnalyze(opts: Opts) {
  * fetched. Pass [refetch] = true to re-fetch every PR regardless. Stale shards
  * (PRs no longer in the window) are pruned. Returns (fetched, reused) counts.
  */
+/**
+ * The PR set to analyze for [repo]@[branch]: merged PRs (git-first / gh) PLUS open (incl. draft)
+ * PRs (gh-only). Each open PR's head is fetched so the impact walk can read its blobs offline.
+ * Returns null only when there is NO PR source at all (merged unknown AND no open) — callers use
+ * that to keep prior artifacts rather than prune them.
+ */
+private fun collectPulls(repo: File, branch: String, max: Int): List<GitHub.Pr>? {
+    val merged = GitHub.mergedPulls(repo, branch, max)
+    val open = GitHub.openPulls(repo, branch, max)
+    for (pr in open) pr.headOid?.let { GitLog.fetchPullHead(repo, pr.number, it) }
+    if (merged == null && open.isEmpty()) return null
+    return (merged ?: emptyList()) + open
+}
+
 private fun writePullFiles(projectDir: File, project: String, repo: File, branch: String,
                            pulls: List<GitHub.Pr>, refetch: Boolean,
                            pathFilter: ((String) -> Boolean)? = null): Pair<Int, Int> {
@@ -234,9 +248,10 @@ private fun writePullFiles(projectDir: File, project: String, repo: File, branch
     var fetched = 0; var reused = 0
     for (pr in pulls) {
         val shardFile = File(shardDir, "${pr.number}.json")
-        // reuse an already-collected PR (immutable) unless a refetch is forced
+        // reuse an already-collected PR (immutable) unless a refetch is forced. An OPEN PR's files
+        //   keep changing, so never reuse its shard — always re-collect.
         var shard: Map<String, Any?>? =
-            if (!refetch && shardFile.isFile) GitHub.readShard(shardFile)?.also { reused++ } else null
+            if (!refetch && !pr.isOpen && shardFile.isFile) GitHub.readShard(shardFile)?.also { reused++ } else null
         if (shard == null) {                                   // new PR (or forced/unreadable): collect via git/gh
             val all = GitHub.pullFiles(repo, pr)
             if (all == null) {                                 // both sources failed: preserve any prior shard, don't prune it
@@ -557,8 +572,8 @@ private fun runImpactStep(targets: List<ImpactTarget>, graph: CallGraph, outDir:
             else -> {
                 val cacheKey = "${g.canonicalPath} $branch"
                 val pulls = pullsCache.getOrPut(cacheKey) {
-                    System.err.println("  → ${g.name}@$branch: fetching merged PRs (git-first, max $impactMax)…")
-                    GitHub.mergedPulls(g, branch, impactMax)
+                    System.err.println("  → ${g.name}@$branch: fetching PRs (merged git-first + open via gh, max $impactMax)…")
+                    collectPulls(g, branch, impactMax)
                 }
                 val impactFile = File(pdir, "${u.name}.impact.json")
                 val filter = u.pathFilter
@@ -872,12 +887,12 @@ private fun cmdImpact(opts: Opts) {
     // current graph: load --graph, else analyze --repo/--project
     val graph = opts["--graph"]?.let { JsonOutput.read(File(it).readText()) } ?: graphFromOpts(opts).first
     val max = opts["--max"]?.toIntOrNull() ?: 10
-    val pulls = GitHub.mergedPulls(git, branch, max)
+    val pulls = collectPulls(git, branch, max)
     if (pulls == null) {
         System.err.println("impact: no PR source for base $branch — git has no PR markers (merge/squash) and gh is unavailable"); exitProcess(1)
     }
     if (pulls.isEmpty()) {
-        System.err.println("impact: no merged PRs for base $branch"); exitProcess(1)
+        System.err.println("impact: no merged or open PRs for base $branch"); exitProcess(1)
     }
     System.err.println("impact: ${git.name} base $branch, ${pulls.size} PRs")
     val result = Impact.analyze(git, branch, pulls, graph)

@@ -24,7 +24,13 @@ object GitHub {
         val mergedAt: String?,
         val mergeCommit: String?,   // merge/squash commit oid; null if unavailable
         val status: String = "merged",   // PR 상태: merged/open/closed/draft. git-first 산출 PR은 머지 이력이라 항상 merged.
-    )
+        val headOid: String? = null,     // open PR head commit oid (analyzed revision); null for merged
+        val updatedAt: String? = null,   // open PR last-updated (date for display/sort); null for merged
+    ) {
+        /** The commit whose net diff is this PR's change set: merge/squash oid, or an open PR's head. */
+        val analyzedCommit: String? get() = mergeCommit ?: headOid
+        val isOpen: Boolean get() = status == "open" || status == "draft"
+    }
 
     /**
      * One file's change set within a PR, from the REST `pulls/{n}/files` endpoint —
@@ -143,6 +149,43 @@ object GitHub {
     }
 
     /**
+     * Open (incl. draft) PRs targeting [base] via `gh pr list --state open`. gh-ONLY: an open PR
+     * has no commit on the base branch's first-parent history, so git-log can't surface it. Returns
+     * an empty list when `gh` can't run or there is no remote — i.e. simply "no open PRs".
+     */
+    fun openPulls(repo: File, base: String?, limit: Int): List<Pr> {
+        val args = mutableListOf(
+            "pr", "list", "--state", "open", "--limit", limit.toString(),
+            "--json", "number,title,author,headRefOid,createdAt,updatedAt,isDraft",
+        )
+        if (base != null) { args.add("--base"); args.add(base) }
+        val (out, code) = run(repo, args)
+        if (code != 0) return emptyList()
+        return parseOpen(out)
+    }
+
+    /** Parse `gh pr list` open-state JSON (headRefOid/updatedAt/isDraft) into open PRs. Pure. */
+    fun parseOpen(json: String): List<Pr> {
+        val root = try { mapper.readTree(json) } catch (_: Exception) { return emptyList() }
+        if (root == null || !root.isArray) return emptyList()
+        return root.mapNotNull { n ->
+            val number = n["number"]?.takeIf { it.isNumber }?.asInt() ?: return@mapNotNull null
+            val updated = n["updatedAt"]?.asText()?.ifBlank { null } ?: n["createdAt"]?.asText()?.ifBlank { null }
+            val isDraft = n["isDraft"]?.asBoolean() ?: false
+            Pr(
+                number = number,
+                title = n["title"]?.asText().orEmpty(),
+                author = n["author"]?.get("login")?.asText()?.ifBlank { null },
+                mergedAt = null,                                            // open — not merged yet
+                mergeCommit = null,
+                status = if (isDraft) "draft" else "open",
+                headOid = n["headRefOid"]?.asText()?.ifBlank { null },
+                updatedAt = updated,
+            )
+        }
+    }
+
+    /**
      * File-level change set of a single PR (status + unified patch).
      *
      * GIT-FIRST: when the PR's [Pr.mergeCommit] is known, derive it locally from
@@ -244,7 +287,8 @@ object GitHub {
      */
     fun buildShard(pr: Pr, files: List<PrFile>, webBase: String?): Map<String, Any?> = linkedMapOf(
         "command" to "pull-files", "number" to pr.number, "title" to pr.title,
-        "author" to pr.author, "mergedAt" to pr.mergedAt, "mergeCommit" to pr.mergeCommit,
+        "author" to pr.author, "mergedAt" to pr.mergedAt, "updatedAt" to pr.updatedAt,
+        "mergeCommit" to pr.analyzedCommit,
         "status" to pr.status,
         "url" to webBase?.let { "$it/pull/${pr.number}" }, "repoUrl" to webBase,
         "additions" to files.sumOf { it.additions },
@@ -266,7 +310,8 @@ object GitHub {
      */
     fun indexEntry(shard: Map<String, Any?>, shardDir: String): Map<String, Any?> = linkedMapOf(
         "number" to shard["number"], "title" to shard["title"], "author" to shard["author"],
-        "mergedAt" to shard["mergedAt"], "status" to (shard["status"] ?: "merged"), "url" to shard["url"],
+        "mergedAt" to shard["mergedAt"], "updatedAt" to shard["updatedAt"],
+        "status" to (shard["status"] ?: "merged"), "url" to shard["url"],
         "additions" to shard["additions"], "deletions" to shard["deletions"],
         "changedFiles" to shard["changedFiles"],
         "file" to "$shardDir/${shard["number"]}.json",
