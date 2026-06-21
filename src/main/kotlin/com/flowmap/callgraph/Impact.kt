@@ -60,9 +60,16 @@ object Impact {
 
         try {
             for (pr in pulls) {
-                val sha = pr.mergeCommit ?: continue
-                val parent = GitLog.firstParent(repo, sha)
-                val changes = GitLog.changesIn(repo, sha).let { all ->
+                // Analyzed revision: merged PR → merge/squash commit; open PR → its (fetched) head.
+                val sha = pr.analyzedCommit ?: continue
+                // Base side of the net diff: open PR → merge-base(base branch, head) so commits already
+                //   on the base branch are excluded; merged PR → first parent. When an open PR head isn't
+                //   available locally (fetch failed / no remote) the diff is empty and the PR still
+                //   appears in the list with zero impacted endpoints.
+                val parent = if (pr.isOpen) GitLog.mergeBase(repo, base, sha) else GitLog.firstParent(repo, sha)
+                val rawChanges = if (pr.isOpen) GitLog.changesBetween(repo, parent ?: base, sha)
+                                 else GitLog.changesIn(repo, sha)
+                val changes = rawChanges.let { all ->
                     if (pathFilter == null) all
                     else all.filter { pathFilter(it.path) || (it.oldPath?.let(pathFilter) ?: false) }
                 }
@@ -136,7 +143,8 @@ object Impact {
                 // LEAN index row: list/overview data only (counts + precomputed endpoints).
                 perPullIndex.add(linkedMapOf(
                     "number" to pr.number, "title" to pr.title, "author" to pr.author,
-                    "mergedAt" to pr.mergedAt, "mergeCommit" to sha, "status" to pr.status,
+                    "mergedAt" to pr.mergedAt, "updatedAt" to pr.updatedAt,
+                    "mergeCommit" to sha, "status" to pr.status,
                     "changedNodeCount" to changedFns.size,
                     "changedFileCount" to changes.size,
                     "impactedEndpoints" to impacted.map { endpointRef(it) },

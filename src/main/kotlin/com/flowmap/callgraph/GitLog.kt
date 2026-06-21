@@ -147,9 +147,35 @@ object GitLog {
     fun firstParent(repo: File, sha: String): String? =
         run(repo, "rev-parse", "--verify", "--quiet", "$sha^1").trim().ifEmpty { null }
 
+    /**
+     * Best common ancestor of [a] and [b] — the base side of an OPEN PR's net change
+     * (`merge-base(<branch>, <head>)`), so the diff excludes commits already on the base branch.
+     * Null when either ref is unknown.
+     */
+    fun mergeBase(repo: File, a: String, b: String): String? =
+        run(repo, "merge-base", a, b).trim().ifEmpty { null }
+
+    /** True when [sha] resolves to a commit present locally (e.g. after fetching a PR head). */
+    fun hasCommit(repo: File, sha: String): Boolean =
+        run(repo, "rev-parse", "--verify", "--quiet", "$sha^{commit}").trim().isNotEmpty()
+
+    /**
+     * Fetch an open PR's head into the local object store (`git fetch origin pull/<n>/head`) so its
+     * blobs/diff are available offline to the impact walk. Best-effort: returns true only when the
+     * head commit is present afterwards (works on GitHub/GHE; no-op without a usable remote).
+     */
+    fun fetchPullHead(repo: File, number: Int, headOid: String): Boolean {
+        runWithCode(repo, "fetch", "--quiet", "origin", "pull/$number/head")
+        return hasCommit(repo, headOid)
+    }
+
     /** Per-file new-side changed line ranges for [sha] vs its first parent. */
     fun changesIn(repo: File, sha: String): List<FileChange> =
         parseDiff(run(repo, "show", sha, "--first-parent", "-U0", "-M", "--no-color", "--format="))
+
+    /** New-side changed files + line ranges for `base..head` (rename-aware), like [changesIn]. */
+    fun changesBetween(repo: File, base: String, head: String): List<FileChange> =
+        parseDiff(run(repo, "diff", base, head, "-U0", "-M", "--no-color"))
 
     /** Content of [path] at [sha], or null if absent. */
     fun fileAt(repo: File, sha: String, path: String): String? =
