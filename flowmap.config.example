@@ -11,7 +11,7 @@ REPO=.repo
 # ───────────── 선택 (optional) ─────────────
 # COMMAND=refresh                 # 실행 subcommand (analyze|merge|openapi|impact|refresh)
 # OUT_DIR=json                    # 분석기 staging 디렉터리 (_combined/_openapi/_manifest 보관) -> --out-dir
-# SYNC_DIR=../docs/web/data   # 웹앱 data 디렉터리: per-project 산출물 + manifest.json 취합
+# SYNC_DIR=../web/data   # 웹앱 data 디렉터리: per-project 산출물 + manifest.json 취합
 # FRONTEND_DIR=../flowmap-react/json  # 프론트/nexcore json (CSV) — SYNC_DIR 로 함께 취합 -> --frontend-dir
 # PUBLIC_ONLY=true                # 공개 메서드만 유지(public->private->public 을 public->public 으로 계약)
 # EXTRA_ARGS=--no-pull --no-impact    # 추가 플래그(끝에 그대로 덧붙임)
