@@ -150,6 +150,7 @@ flowchart LR
 | `openapi` | repo 소스(+`--restdocs`) | OpenAPI 3.1 JSON | 요청/응답 스키마 → Redoc/Scalar 웹문서 |
 | `impact` | git repo + 그래프 | 커밋별 변경 영향도 JSON | 커밋 변경 → 메서드 → 영향 엔드포인트/서비스 |
 | `combine` | 서비스별 그래프들 | 통합 그래프(S2S/이벤트) | 서비스 간 호출·Kafka·DB 결합 |
+| `sync` | 분석기 `json/` 트리 | 웹앱 `web/data/`(+manifest 병합) | 재분석 없이 산출물만 웹 data 로 취합 |
 | `search`/`stats` | 그래프 | 서브그래프 / 요약 | 특정 메서드 BFS, 통계 |
 
 ---
@@ -223,19 +224,26 @@ cp flowmap.config.example flowmap.config   # REPO 등 값 작성 후 ./gradlew r
 
 ### 산출물 레이아웃 — `json/projects/<프로젝트>/`
 
-`refresh` 는 프로젝트별 산출물을 **`json/projects/<프로젝트명>/`** 폴더로 분리해서 씁니다:
+`refresh` 는 프로젝트별 산출물을 **실제 git namespace/repo 를 따라 중첩**한
+**`json/projects/<namespace>/<repo>/<per-root>/`** 폴더로 분리해서 씁니다(`<per-root>` = 전역 유일
+프로젝트명, 모노레포면 sub-project, 단일 repo 면 repo 명과 동일):
 
 ```
 json/
 ├── _combined.json   _openapi.json   _manifest.json     # 저장소 전체 집계
 └── projects/
-    └── <프로젝트>/
-        ├── <프로젝트>.json            # 호출그래프
-        ├── <프로젝트>.openapi.json    # OpenAPI
-        ├── <프로젝트>.impact.json     # 커밋/PR 영향도 인덱스
-        ├── <프로젝트>.impact/<PR>.json  # PR별 상세 샤드(지연 로드)
-        └── <프로젝트>.pulls.json + <프로젝트>.pulls/<PR>.json  # PR 파일 diff
+    └── <namespace>/<repo>/<per-root>/                  # 예: samples/sample-shop/sample-shop/
+        ├── <per-root>.json            # 호출그래프
+        ├── <per-root>.openapi.json    # OpenAPI
+        ├── <per-root>.gateway.json    # (게이트웨이 프로젝트) 자동발견 라우트 테이블
+        ├── <per-root>.impact.json     # 커밋/PR 영향도 인덱스
+        ├── <per-root>.impact/<PR>.json  # PR별 상세 샤드(지연 로드)
+        └── <per-root>.pulls.json + <per-root>.pulls/<PR>.json  # PR 파일 diff
 ```
+
+> namespace/repo 도출: 소스가 자체 git repo 면 origin remote 의 owner/repo, origin 이 없으면
+> `flowmap.config` 의 `NAMESPACE`(미지정 시 owner 폴백) + repo 명. 분석기 자신에 번들된 데모 샘플은
+> `samples/<dir>`. `wallga.yml` 모노레포는 repo 슬롯=실제 repo 명, per-root=각 sub-project.
 
 ### `wallga.yml` — 모노레포를 배포 단위(sub-project)로 분리
 
